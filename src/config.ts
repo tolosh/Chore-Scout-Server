@@ -36,12 +36,12 @@ const intFrom = (name: string, def: number, min: number, max: number) =>
     .transform((v, ctx) => {
       if (v === undefined || v === '') return def
       if (!/^\d+$/.test(v)) {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${name} must be an integer` })
+        ctx.addIssue({ code: 'custom', message: `${name} must be an integer` })
         return z.NEVER
       }
       const n = Number(v)
       if (n < min || n > max) {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${name} must be between ${min} and ${max}` })
+        ctx.addIssue({ code: 'custom', message: `${name} must be between ${min} and ${max}` })
         return z.NEVER
       }
       return n
@@ -102,13 +102,15 @@ export function loadConfig<R extends Role>(role: R, env: Record<string, string |
   if (role !== 'jobs' && env.BOB_ALLOWANCE_CREDENTIAL) {
     problems.push('BOB_ALLOWANCE_CREDENTIAL is only permitted in the jobs process')
   }
-  const schema = role === 'jobs' ? base.merge(jobsExtra) : base
+  const schema = role === 'jobs' ? base.extend(jobsExtra.shape) : base
   const parsed = schema.safeParse(env)
   if (!parsed.success) {
     for (const issue of parsed.error.issues) {
       const key = issue.path.join('.') || '(root)'
       // Never echo values: only the key and the rule.
-      problems.push(issue.code === 'invalid_type' && issue.received === 'undefined' ? `${key} is required` : `${key}: ${issue.message}`)
+      // zod 4 issues carry no `received`; a missing top-level key is read from the input itself.
+      const missing = issue.code === 'invalid_type' && issue.path.length === 1 && env[String(issue.path[0])] === undefined
+      problems.push(missing ? `${key} is required` : `${key}: ${issue.message}`)
     }
   }
   if (parsed.success && parsed.data.MONGO_MIN_POOL_SIZE > parsed.data.MONGO_MAX_POOL_SIZE) {
