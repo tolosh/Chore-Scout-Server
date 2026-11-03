@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# The candidate is the PR head commit, not GitHub's synthetic merge commit, so
+# the image tag and /health report a SHA that exists on the branch.
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -24,6 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -51,6 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 0
       - name: gitleaks (full history)
         run: |
@@ -62,20 +69,22 @@ jobs:
     needs: [verify, secrets-scan]
     runs-on: ubuntu-24.04
     env:
-      IMAGE: chore-scout-server:${{ github.sha }}
+      IMAGE: chore-scout-server:${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
       - name: Build image tagged with the commit SHA (no mutable tags)
         run: |
           set -euo pipefail
-          docker build --platform linux/amd64 --build-arg GIT_SHA="${GITHUB_SHA}" -t "$IMAGE" .
-          if docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '^chore-scout-server:' | grep -v ":${GITHUB_SHA}$"; then
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          docker build --platform linux/amd64 --build-arg GIT_SHA="${CANDIDATE_SHA}" -t "$IMAGE" .
+          if docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -E '^chore-scout-server:' | grep -v ":${CANDIDATE_SHA}$"; then
             echo "unexpected non-SHA tag" >&2; exit 1
           fi
           echo "image=$IMAGE"
           echo "image id (config digest): $(docker image inspect --format '{{.Id}}' "$IMAGE")"
           echo "revision label: $(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
-          docker buildx imagetools inspect node:22-alpine --format '{{.Manifest.Digest}}' | sed 's/^/node:22-alpine digest: /' || true
       - name: Boot without secrets fails closed (exit 78)
         run: |
           set +e
@@ -93,14 +102,14 @@ jobs:
             if body=$(curl -fsS http://127.0.0.1:3000/health); then break; fi; sleep 2
           done
           echo "health: $body"
-          test "$(echo "$body" | jq -r .sha)" = "${GITHUB_SHA}"
+          test "$(echo "$body" | jq -r .sha)" = "${CANDIDATE_SHA}"
           curl -fsS http://127.0.0.1:3000/ready
           docker logs cs | tail -20
       - name: Save image archive
         run: docker save "$IMAGE" | gzip > image.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: chore-scout-server-${{ github.sha }}
+          name: chore-scout-server-${{ env.CANDIDATE_SHA }}
           path: image.tar.gz
           retention-days: 7
       # OWNER ACTION (G3): hosting and registry are undecided. When decided,
