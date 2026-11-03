@@ -1,0 +1,6 @@
+{
+  "source": "tolosh/moroku-dsl src/schema/typeDefs.ts at 4e8ce3e (the DSL unchanged since, per spec 3220570116 header)",
+  "types": ["Account", "Customer", "DateTime", "InitiatePaymentInput", "InitiatePaymentResult", "JSON", "Money", "Node", "OpenAccountInput", "PageInfo", "Payment", "PaymentError", "TopUpAccountInput", "Transaction", "TransactionConnection", "TransactionEdge", "VerifyOtpInput", "VerifyOtpResult"],
+  "queryFields": ["me", "account", "accounts", "transactions", "balance"],
+  "mutationFields": ["initiatePayment", "topUpAccount", "openAccount", "verifyOtp"]
+}
