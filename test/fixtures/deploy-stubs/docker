@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Test stub for docker (CS-3992 deploy.sh tests).
+set -euo pipefail
+echo "docker $*" >>"$STUB_DIR/calls.log"
+case "$1" in
+  login) cat >/dev/null ;;
+  push) touch "$STUB_DIR/pushed" ;;
+esac

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test stub for git (CS-3992 deploy.sh tests): only `git rev-parse HEAD`.
+set -euo pipefail
+[[ "$*" == "rev-parse HEAD" ]] || { echo "git stub: unexpected call: $*" >&2; exit 99; }
+echo "$STUB_HEAD"

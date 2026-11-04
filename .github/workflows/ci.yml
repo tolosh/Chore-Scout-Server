@@ -1,9 +1,9 @@
 name: ci
 
 # CS-3941. Runs on every PR and on main. Builds and tests; builds an image
-# tagged with the commit SHA. Pushes and deploys nothing: hosting is undecided
-# (owner gap G3), so the registry push is a disabled step and no cloud
-# credentials are referenced.
+# tagged with the commit SHA. CI pushes and deploys nothing and references no
+# cloud credentials. Pushing and deploying are the manual deploy workflow's job
+# (.github/workflows/deploy.yml, CS-3992).
 
 on:
   pull_request:
@@ -98,13 +98,25 @@ jobs:
           docker run -d --name mongo --network cs mongo:7.0
           docker run -d --name cs --network cs -p 3000:3000 \
             -e MONGODB_URI=mongodb://mongo:27017 -e MONGODB_DB=chorescout "$IMAGE"
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if body=$(curl -fsS http://127.0.0.1:3000/health); then break; fi; sleep 2
           done
           echo "health: $body"
           test "$(echo "$body" | jq -r .sha)" = "${CANDIDATE_SHA}"
           curl -fsS http://127.0.0.1:3000/ready
           docker logs cs | tail -20
+      - name: Smoke - container health check passes, then fails with the database stopped
+        run: |
+          set -euo pipefail
+          docker exec cs test -s /app/certs/rds-global-bundle.pem
+          docker exec cs node dist/healthcheck.js
+          echo "health check with database up: exit 0"
+          docker stop mongo
+          set +e
+          docker exec cs node dist/healthcheck.js; code=$?
+          set -e
+          echo "health check with database stopped: exit $code"
+          test "$code" -ne 0
       - name: Save image archive
         run: docker save "$IMAGE" | gzip > image.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -112,10 +124,3 @@ jobs:
           name: chore-scout-server-${{ env.CANDIDATE_SHA }}
           path: image.tar.gz
           retention-days: 7
-      # OWNER ACTION (G3): hosting and registry are undecided. When decided,
-      # enable this step with an OIDC role (no long-lived keys), push the SHA tag
-      # only, and record the registry digest for the deploy to pin.
-      - name: Push to registry (disabled until hosting is decided, G3)
-        if: ${{ false }}
-        run: |
-          echo "push ${IMAGE} to <registry>; record the pushed digest; deploy pins by digest"

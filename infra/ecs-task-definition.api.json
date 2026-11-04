@@ -1,0 +1,46 @@
+{
+  "family": "chore-scout-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::932027117528:role/chore-scout-server-execution-role",
+  "taskRoleArn": "arn:aws:iam::932027117528:role/chore-scout-server-task-role",
+  "containerDefinitions": [
+    {
+      "name": "chore-scout-api",
+      "image": "__IMAGE_PINNED_AT_DEPLOY__",
+      "essential": true,
+      "command": ["node", "dist/main.js"],
+      "portMappings": [
+        { "name": "chore-scout-api", "containerPort": 3000, "protocol": "tcp", "appProtocol": "http" }
+      ],
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "PORT", "value": "3000" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "AWS_REGION", "value": "ap-southeast-2" },
+        { "name": "CS_SECRETS_ID", "value": "chore-scout-server/api" },
+        { "name": "MONGODB_DB", "value": "chorescout" },
+        { "name": "MONGODB_TLS_CA_FILE", "value": "/app/certs/rds-global-bundle.pem" }
+      ],
+      "linuxParameters": { "initProcessEnabled": true },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/chore-scout-server",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "api"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD", "node", "dist/healthcheck.js"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      }
+    }
+  ]
+}
