@@ -16,16 +16,23 @@
 # update the service -> stable wait -> summary. A failure before the
 # update-service step leaves the running service untouched.
 #
-# Bootstrap: if the service does not exist yet (runbook A6 has not been done),
-# the script registers both task definitions and stops (exit 0) without
-# running the migration, so the service can be created on the pinned revision.
-# Run the workflow again afterwards for the full deploy.
+# The service must be ACTIVE. Any other state fails the run, with one opt-in
+# exception: DEPLOY_BOOTSTRAP=1 (the workflow's bootstrap input) allows a first
+# run when the service is MISSING (runbook A6 not done yet). A bootstrap run
+# pushes the image and registers both task definitions, then stops: nothing is
+# deployed and nothing is migrated, and it says so as a ::warning:: and in the
+# job summary. DRAINING or INACTIVE always fail, bootstrap or not, and so does
+# bootstrap against an ACTIVE service.
 #
-# Usage: scripts/deploy.sh <full 40-character commit SHA>
+# The service must have assignPublicIp DISABLED (D48: internal only); the
+# migrate task uses the same networking.
+#
+# Usage: DEPLOY_BOOTSTRAP=0|1 scripts/deploy.sh <full 40-character commit SHA>
 # Run by .github/workflows/deploy.yml with short-lived OIDC credentials. No
 # credentials or secret values appear here: the containers read
 # chore-scout-server/api at run time through CS_SECRETS_ID.
 set -euo pipefail
+shopt -s inherit_errexit
 
 ACCOUNT=932027117528
 REGION=ap-southeast-2
@@ -76,12 +83,15 @@ render_task_definition() {
 
 register_task_definition() {
   local template=$1 image=$2 rendered arn registered_image
+  local out rc=0
   rendered=$(render_task_definition "$template" "$image")
-  read -r arn registered_image < <(aws ecs register-task-definition \
+  out=$(aws ecs register-task-definition \
     --cli-input-json "file://$rendered" --region "$REGION" \
     --query '[taskDefinition.taskDefinitionArn, taskDefinition.containerDefinitions[0].image]' \
-    --output text)
+    --output text) || rc=$?
   rm -f "$rendered"
+  [[ "$rc" == 0 ]] || die "register-task-definition failed for $template (exit $rc)"
+  read -r arn registered_image <<<"$out"
   [[ "$registered_image" == "$image" ]] || die "registered $arn pins '$registered_image', expected '$image'"
   echo "$arn"
 }
@@ -98,6 +108,9 @@ summary() {
     "rollback digest: $ROLLBACK_DIGEST"
     "rollback task definition: $PREV_TD"
   )
+  if [[ "${BOOTSTRAP_RUN:-0}" == 1 ]]; then
+    lines+=("BOOTSTRAP: nothing deployed, no migration")
+  fi
   echo "== deploy summary =="
   printf '  %s\n' "${lines[@]}"
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -108,6 +121,9 @@ summary() {
 main() {
   SHA=${1:-}
   require_full_sha "$SHA"
+  local want_bootstrap=${DEPLOY_BOOTSTRAP:-0}
+  [[ "$want_bootstrap" == 0 || "$want_bootstrap" == 1 ]] || die "DEPLOY_BOOTSTRAP must be 0 or 1, got '$want_bootstrap'"
+  BOOTSTRAP_RUN=0
   cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
   local head
@@ -123,14 +139,24 @@ main() {
 
   # 1. The rollback point, before anything changes.
   echo "Reading $CLUSTER/$SERVICE (rollback point)..."
-  local svc status desired netcfg bootstrap=0
+  local svc status desired netcfg
   svc=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --region "$REGION" --output json)
-  status=$(jq -r '.services[0].status // "MISSING"' <<<"$svc")
+  # ACTIVE, DRAINING or INACTIVE come back in services[]; a service that was
+  # never created comes back as failures[].reason == MISSING.
+  status=$(jq -r '
+    if (.services | length) > 0 then .services[0].status
+    elif ([.failures[]?.reason] | index("MISSING")) != null then "MISSING"
+    else "UNKNOWN" end' <<<"$svc")
+  if [[ "$status" == "ACTIVE" && "$want_bootstrap" == 1 ]]; then
+    die "bootstrap was requested but $CLUSTER/$SERVICE is ACTIVE; run again without bootstrap"
+  fi
   if [[ "$status" == "ACTIVE" ]]; then
     PREV_TD=$(jq -r '.services[0].taskDefinition' <<<"$svc")
     netcfg=$(jq -c '.services[0].networkConfiguration' <<<"$svc")
     [[ "$(jq -r '.awsvpcConfiguration.subnets | length' <<<"$netcfg")" -gt 0 ]] \
       || die "$SERVICE has no awsvpc subnets; cannot place the migrate task"
+    [[ "$(jq -r '.awsvpcConfiguration.assignPublicIp' <<<"$netcfg")" == DISABLED ]] \
+      || die "$SERVICE must have assignPublicIp DISABLED (D48: internal only)"
     local prev_image
     prev_image=$(aws ecs describe-task-definition --task-definition "$PREV_TD" --region "$REGION" \
       --query "taskDefinition.containerDefinitions[?name=='$API_CONTAINER'].image | [0]" --output text)
@@ -138,11 +164,15 @@ main() {
     ROLLBACK_DIGEST=${prev_image#"$REPO@"}
     echo "Rollback task definition: $PREV_TD"
     echo "Rollback digest:          $ROLLBACK_DIGEST"
-  else
-    bootstrap=1
+  elif [[ "$status" == "MISSING" && "$want_bootstrap" == 1 ]]; then
+    BOOTSTRAP_RUN=1
     PREV_TD="none (service $SERVICE does not exist)"
     ROLLBACK_DIGEST="none (service $SERVICE does not exist)"
-    echo "Service $CLUSTER/$SERVICE does not exist (status $status): bootstrap run, registration only."
+    echo "::warning::BOOTSTRAP: $CLUSTER/$SERVICE does not exist. Registering task definitions only; nothing deployed, no migration."
+  elif [[ "$status" == "MISSING" ]]; then
+    die "$CLUSTER/$SERVICE does not exist. For the first run only, run the workflow with bootstrap, create the service (runbook A6), then run it again without bootstrap"
+  else
+    die "$CLUSTER/$SERVICE status is $status; refusing to deploy (only ACTIVE deploys; bootstrap applies only to MISSING)"
   fi
 
   # 2. Build and push :<full SHA>, then resolve the digest. The repo is
@@ -177,10 +207,10 @@ main() {
   echo "Registered: $API_TD"
   echo "Registered: $MIGRATE_TD"
 
-  if [[ "$bootstrap" == 1 ]]; then
+  if [[ "$BOOTSTRAP_RUN" == 1 ]]; then
     MIGRATE_EXIT="not run (bootstrap)"
     summary
-    echo "BOOTSTRAP: create $CLUSTER/$SERVICE at desired 0 on $API_TD (runbook A6), then run the workflow again."
+    echo "BOOTSTRAP: create $CLUSTER/$SERVICE at desired 0 on $API_TD (runbook A6), then run the workflow again without bootstrap."
     return 0
   fi
 

@@ -14,6 +14,10 @@ case "$1 $2" in
       exit 254
     fi ;;
   "ecs register-task-definition")
+    if [[ "${STUB_REGISTER_RC:-0}" != 0 ]]; then
+      echo "An error occurred (ClientException) when calling the RegisterTaskDefinition operation" >&2
+      exit "$STUB_REGISTER_RC"
+    fi
     file=""
     while [[ $# -gt 0 ]]; do
       if [[ "$1" == --cli-input-json ]]; then file=${2#file://}; fi

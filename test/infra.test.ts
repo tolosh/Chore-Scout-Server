@@ -50,15 +50,14 @@ describe('IAM policies (CS-3992)', () => {
     }
   })
 
-  it('task role reads only chore-scout-server/api and writes only its own log group', () => {
+  it('task role reads only chore-scout-server/api and has no logs permissions (awslogs uses the execution role)', () => {
     const s = statements('infra/iam/task-role-policy.json')
     const secrets = s.filter((x) => list(x.Action).some((a) => a.startsWith('secretsmanager:')))
     expect(secrets.flatMap((x) => list(x.Action))).toEqual(['secretsmanager:GetSecretValue'])
     expect(secrets.flatMap((x) => list(x.Resource))).toEqual([
       `arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:chore-scout-server/api-??????`,
     ])
-    const logs = s.filter((x) => list(x.Action).some((a) => a.startsWith('logs:')))
-    expect(logs.flatMap((x) => list(x.Resource))).toEqual([`arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/ecs/chore-scout-server:*`])
+    expect(s.some((x) => list(x.Action).some((a) => a.startsWith('logs:')))).toBe(false)
   })
 
   it('execution role pulls only from chore-scout-server and reads no secrets', () => {
@@ -91,7 +90,9 @@ describe('IAM policies (CS-3992)', () => {
     for (const a of forbidden) expect(resourcesFor(a)).toEqual([])
   })
 
-  it('deploy role trust: GitHub OIDC, this repo, main only', () => {
+  // The sub claim uses GitHub's immutable format for this repo (created after 15 Jul 2026)
+  // and its canonical casing. Confirmed by the OIDC claims probe, actions run 41813888223.
+  it('deploy role trust: GitHub OIDC, this repo (immutable sub, canonical casing), main only', () => {
     const [t, ...rest] = statements('infra/iam/deploy-role-trust-policy.json') as unknown as Array<{
       Principal: { Federated: string }
       Action: string
@@ -100,10 +101,12 @@ describe('IAM policies (CS-3992)', () => {
     expect(rest).toHaveLength(0)
     expect(t!.Principal.Federated).toBe(`arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com`)
     expect(t!.Action).toBe('sts:AssumeRoleWithWebIdentity')
+    expect(Object.keys(t!.Condition)).toEqual(['StringEquals'])
+    expect(JSON.stringify(t!.Condition)).not.toMatch(/[*?]/)
     expect(t!.Condition).toEqual({
       StringEquals: {
         'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-        'token.actions.githubusercontent.com:sub': 'repo:tolosh/chore-scout-server:ref:refs/heads/main',
+        'token.actions.githubusercontent.com:sub': 'repo:tolosh@9541661/Chore-Scout-Server@1442469518:ref:refs/heads/main',
       },
     })
   })

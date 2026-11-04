@@ -18,9 +18,9 @@ const PREV_TD = 'arn:aws:ecs:ap-southeast-2:932027117528:task-definition/chore-s
 const NETCFG = {
   awsvpcConfiguration: { subnets: ['subnet-0aaa', 'subnet-0bbb'], securityGroups: ['sg-0ccc'], assignPublicIp: 'DISABLED' },
 }
-const activeService = (desired = 1) =>
+const activeService = (desired = 1, status = 'ACTIVE', netcfg: object = NETCFG) =>
   JSON.stringify({
-    services: [{ status: 'ACTIVE', taskDefinition: PREV_TD, desiredCount: desired, networkConfiguration: NETCFG }],
+    services: [{ status, taskDefinition: PREV_TD, desiredCount: desired, networkConfiguration: netcfg }],
     failures: [],
   })
 const missingService = JSON.stringify({ services: [], failures: [{ arn: 'x', reason: 'MISSING' }] })
@@ -190,13 +190,89 @@ describe('deploy.sh flow (stubbed AWS)', () => {
     expect(calls().some((l) => l.includes('register-task-definition'))).toBe(false)
   })
 
-  it('bootstrap: with no service yet, registers both task definitions and stops', async () => {
+  it('fails when register-task-definition fails, before any migration or update', async () => {
+    const r = await deploy(SHA, { STUB_REGISTER_RC: '254' })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('register-task-definition failed')
+    expect(calls().some((l) => /run-task|update-service/.test(l))).toBe(false)
+  })
+
+  it.each([
+    ['ENABLED', { ...NETCFG, awsvpcConfiguration: { ...NETCFG.awsvpcConfiguration, assignPublicIp: 'ENABLED' } }],
+    ['absent', { awsvpcConfiguration: { subnets: ['subnet-0aaa'], securityGroups: ['sg-0ccc'] } }],
+  ])('refuses a service whose assignPublicIp is %s (D48), before building or changing anything', async (_l, netcfg) => {
+    const r = await deploy(SHA, { STUB_SERVICES_JSON: activeService(1, 'ACTIVE', netcfg) })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('assignPublicIp DISABLED')
+    expect(calls().some((l) => /^docker|register-task-definition|run-task|update-service/.test(l.replace(/^aws /, '')))).toBe(false)
+  })
+})
+
+describe('deploy.sh bootstrap is opt-in (CS-3992 R2)', () => {
+  const nothingChanged = () => {
+    const c = calls()
+    expect(c.some((l) => /^docker (build|push)/.test(l))).toBe(false)
+    expect(c.some((l) => /register-task-definition|run-task|update-service/.test(l))).toBe(false)
+  }
+
+  it('without bootstrap, a MISSING service fails the run and changes nothing', async () => {
     const r = await deploy(SHA, { STUB_SERVICES_JSON: missingService })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('does not exist')
+    expect(r.stderr).toContain('bootstrap')
+    nothingChanged()
+  })
+
+  it('with bootstrap and a MISSING service: registers both task definitions, warns, and deploys nothing', async () => {
+    const summaryFile = join(dir, 'step-summary.md')
+    const r = await deploy(SHA, { STUB_SERVICES_JSON: missingService, DEPLOY_BOOTSTRAP: '1', GITHUB_STEP_SUMMARY: summaryFile })
     expect(r.status).toBe(0)
     const c = calls()
     expect(c.some((l) => l.includes('register-task-definition'))).toBe(true)
     expect(c.some((l) => /run-task|update-service|describe-task-definition/.test(l))).toBe(false)
+    expect(r.stdout).toMatch(/^::warning::BOOTSTRAP: .*nothing deployed, no migration/m)
     expect(r.stdout).toContain('migrate exit code: not run (bootstrap)')
     expect(r.stdout).toContain('BOOTSTRAP: create moroku-dsl-dev/chore-scout-api')
+    expect(readFileSync(summaryFile, 'utf8')).toContain('BOOTSTRAP: nothing deployed, no migration')
+  })
+
+  it.each(['DRAINING', 'INACTIVE'])('a %s service always fails, with or without bootstrap', async (status) => {
+    for (const b of ['0', '1']) {
+      rmSync(join(dir, 'calls.log'), { force: true })
+      const r = await deploy(SHA, { STUB_SERVICES_JSON: activeService(1, status), DEPLOY_BOOTSTRAP: b })
+      expect(r.status, `bootstrap=${b}`).not.toBe(0)
+      expect(r.stderr).toContain(`status is ${status}`)
+      nothingChanged()
+    }
+  })
+
+  it('an unrecognised describe-services answer fails, even with bootstrap', async () => {
+    const r = await deploy(SHA, { STUB_SERVICES_JSON: JSON.stringify({ services: [], failures: [] }), DEPLOY_BOOTSTRAP: '1' })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('status is UNKNOWN')
+    nothingChanged()
+  })
+
+  it('bootstrap against an ACTIVE service fails and changes nothing', async () => {
+    const r = await deploy(SHA, { DEPLOY_BOOTSTRAP: '1' })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('bootstrap was requested but')
+    nothingChanged()
+  })
+
+  it('a DEPLOY_BOOTSTRAP value other than 0 or 1 is refused before any call', async () => {
+    const r = await deploy(SHA, { DEPLOY_BOOTSTRAP: 'true' })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('DEPLOY_BOOTSTRAP must be 0 or 1')
+    expect(calls()).toEqual([])
+  })
+
+  it('a normal run writes no bootstrap line to the job summary', async () => {
+    const summaryFile = join(dir, 'step-summary.md')
+    const r = await deploy(SHA, { GITHUB_STEP_SUMMARY: summaryFile })
+    expect(r.status).toBe(0)
+    const md = readFileSync(summaryFile, 'utf8')
+    expect(md).toContain(`- sha: ${SHA}`)
+    expect(md).not.toContain('BOOTSTRAP')
   })
 })
