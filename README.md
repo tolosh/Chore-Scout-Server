@@ -55,7 +55,7 @@ Deploys are manual: **Actions -> deploy -> Run workflow** on `main` (`.github/wo
 `scripts/deploy.sh <full SHA>` does the work, in this order:
 
 1. Refuses anything but the full 40-character SHA of the checked-out commit.
-2. Requires the service to be ACTIVE with `assignPublicIp` DISABLED (D48), reads its current task definition and records the **rollback image by digest**. A tag there is refused before anything changes.
+2. Requires the service to be ACTIVE with the agreed network configuration (below), reads its current task definition and records the **rollback image by digest**. A tag there is refused before anything changes.
 3. Builds for `linux/amd64` with `--build-arg GIT_SHA`, pushes `:<SHA>` to the immutable ECR repo `chore-scout-server`, and resolves the digest. A SHA already pushed is reused.
 4. Registers `chore-scout-api` and `chore-scout-migrate` pinned to `repo@sha256:...`.
 5. Runs the one-shot migrate task (`node dist/migrate-main.js`) on the service's own subnets and security group, waits for it to stop, and fails on any exit code but 0. The service is not touched on failure.
@@ -64,7 +64,17 @@ Deploys are manual: **Actions -> deploy -> Run workflow** on `main` (`.github/wo
 
 Any service state other than ACTIVE fails the run, with one opt-in exception for the very first run. Tick the workflow's **bootstrap** input (default off) while the service does not exist yet: the run is accepted only if the service is MISSING, pushes the image, registers both task definitions and stops. It deploys and migrates nothing, and says so as a `::warning::` and a "BOOTSTRAP: nothing deployed, no migration" line in the job summary. Create the service on the printed revision (runbook A6), then run the workflow again without bootstrap. DRAINING or INACTIVE always fail, and so does bootstrap against an ACTIVE service.
 
-The server is internal only (D48): no public hostname, load balancer or public IP. The DSL reaches it through ECS Service Connect at `chore-scout-api:3000`.
+### Network (D48 as amended)
+
+The VPC's private subnets have no NAT gateway, so `chore-scout-api` runs in the public subnets **with a public IP**, behind a firewall that admits only the DSL: `chore-scout-server-sg` allows inbound port 3000 from the DSL's security group and nothing else. There is still no public hostname, load balancer or URL. The DSL reaches the server through ECS Service Connect at `chore-scout-api:3000`. Production should move to private subnets with a NAT gateway (D47).
+
+`deploy.sh` refuses to deploy unless the service has all of:
+
+- `assignPublicIp` equal to `EXPECTED_ASSIGN_PUBLIC_IP` (`ENABLED`);
+- exactly one security group;
+- that group's name, resolved with `ec2:DescribeSecurityGroups`, equal to `EXPECTED_SECURITY_GROUP_NAME` (`chore-scout-server-sg`).
+
+Both expected values are set once, at the top of `scripts/deploy.sh`. A public IP is therefore never accepted with any other firewall. The check runs before anything is built or changed, and the migrate task uses the same networking. A bootstrap run has no service yet, so there is nothing to check; the first full deploy after A6 checks it.
 
 ### `infra/`
 
@@ -75,12 +85,12 @@ The server is internal only (D48): no public hostname, load balancer or public I
 | `infra/iam/task-role-policy.json` | `chore-scout-server-task-role`: read `chore-scout-server/api` only, and ECS Exec. No logs permissions: the awslogs driver writes with the execution role |
 | `infra/iam/execution-role-policy.json` | `chore-scout-server-execution-role`: pull from `chore-scout-server` only, write logs |
 | `infra/iam/ecs-tasks-trust-policy.json` | Trust policy for both runtime roles (`ecs-tasks.amazonaws.com`, this account only) |
-| `infra/iam/deploy-role-policy.json` | `chore-scout-server-github-deploy`: one ECR repo, one service, RunTask for the migrate family in `moroku-dsl-dev` only, PassRole for the two server roles to `ecs-tasks.amazonaws.com` only |
+| `infra/iam/deploy-role-policy.json` | `chore-scout-server-github-deploy`: one ECR repo, one service, RunTask for the migrate family in `moroku-dsl-dev` only, PassRole for the two server roles to `ecs-tasks.amazonaws.com` only, and read-only `ec2:DescribeSecurityGroups` for the network check |
 | `infra/iam/deploy-role-trust-policy.json` | GitHub OIDC trust, `StringEquals` on audience `sts.amazonaws.com` and subject `repo:tolosh@9541661/Chore-Scout-Server@1442469518:ref:refs/heads/main` |
 
 The subject uses GitHub's immutable format (owner and repo ids) and the repo's canonical casing, `Chore-Scout-Server`. Both were confirmed from a real token's claims (CS-3992 probe, actions run 41813888223). `StringEquals` is case-sensitive, so `repo:tolosh/chore-scout-server:...` would never match.
 
-The templates hold no secrets. The image placeholder is replaced with the digest at deploy time. `"*"` resources appear only where the AWS API has no resource-level permission: `ecr:GetAuthorizationToken`, `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskDefinition` and `ssmmessages`. `ecs:DescribeTasks` is limited to tasks in `moroku-dsl-dev`; a task ARN does not carry its family, so it cannot be narrowed further.
+The templates hold no secrets. The image placeholder is replaced with the digest at deploy time. `"*"` resources appear only where the AWS API has no resource-level permission: `ecr:GetAuthorizationToken`, `ecs:RegisterTaskDefinition`, `ecs:DescribeTaskDefinition`, `ec2:DescribeSecurityGroups` and `ssmmessages`. `ec2:DescribeSecurityGroups` is read-only and cannot be scoped to a resource; it is the deploy role's only EC2 action. `ecs:DescribeTasks` is limited to tasks in `moroku-dsl-dev`; a task ARN does not carry its family, so it cannot be narrowed further.
 
 ### DocumentDB TLS and the health check
 

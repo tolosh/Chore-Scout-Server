@@ -24,8 +24,16 @@
 # job summary. DRAINING or INACTIVE always fail, bootstrap or not, and so does
 # bootstrap against an ACTIVE service.
 #
-# The service must have assignPublicIp DISABLED (D48: internal only); the
-# migrate task uses the same networking.
+# The service must have the agreed network configuration (D48 as amended,
+# CS-3992 comment 39843): the private subnets have no NAT, so the task runs in
+# the public subnets WITH a public IP, and the only firewall allowed with that
+# public IP is chore-scout-server-sg (inbound port 3000 from the DSL only).
+# require_agreed_network checks all of: assignPublicIp equals
+# EXPECTED_ASSIGN_PUBLIC_IP, exactly one security group, and that group's name
+# (resolved with ec2 describe-security-groups) equals EXPECTED_SECURITY_GROUP_NAME.
+# Anything else fails before any change. The migrate task uses the same
+# networking. A bootstrap run has no service yet, so there is no networking to
+# check; the check applies to the first real deploy after A6.
 #
 # Usage: DEPLOY_BOOTSTRAP=0|1 scripts/deploy.sh <full 40-character commit SHA>
 # Run by .github/workflows/deploy.yml with short-lived OIDC credentials. No
@@ -46,6 +54,11 @@ MIGRATE_CONTAINER=chore-scout-migrate
 API_TEMPLATE=infra/ecs-task-definition.api.json
 MIGRATE_TEMPLATE=infra/ecs-task-definition.migrate.json
 PLACEHOLDER=__IMAGE_PINNED_AT_DEPLOY__
+
+# Agreed network configuration for chore-scout-api (D48 as amended). Change it
+# here only, and only with a new decision.
+EXPECTED_ASSIGN_PUBLIC_IP=ENABLED
+EXPECTED_SECURITY_GROUP_NAME=chore-scout-server-sg
 
 die() {
   echo "deploy: ERROR: $*" >&2
@@ -68,6 +81,26 @@ require_digest_ref() {
   local ref=${1:-}
   [[ "$ref" == "$REPO@sha256:"* && "${ref#"$REPO@"}" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || die "image is not pinned by digest in $REPO: '$ref' (refusing a tag)"
+}
+
+# The service's awsvpc networking must match the agreed configuration exactly.
+require_agreed_network() {
+  local netcfg=$1 public_ip sg_count sg_id sg_name
+  public_ip=$(jq -r '.awsvpcConfiguration.assignPublicIp // "absent"' <<<"$netcfg")
+  [[ "$public_ip" == "$EXPECTED_ASSIGN_PUBLIC_IP" ]] \
+    || die "$SERVICE must have assignPublicIp $EXPECTED_ASSIGN_PUBLIC_IP (D48 as amended), got $public_ip"
+  sg_count=$(jq -r '.awsvpcConfiguration.securityGroups // [] | length' <<<"$netcfg")
+  [[ "$sg_count" == 1 ]] \
+    || die "$SERVICE must have exactly one security group ($EXPECTED_SECURITY_GROUP_NAME), got $sg_count"
+  sg_id=$(jq -r '.awsvpcConfiguration.securityGroups[0]' <<<"$netcfg")
+  [[ "$sg_id" =~ ^sg-[0-9a-f]+$ ]] || die "$SERVICE security group id is malformed: '$sg_id'"
+  local rc=0
+  sg_name=$(aws ec2 describe-security-groups --group-ids "$sg_id" --region "$REGION" \
+    --query 'SecurityGroups[0].GroupName' --output text) || rc=$?
+  [[ "$rc" == 0 ]] || die "could not resolve security group $sg_id (exit $rc)"
+  [[ "$sg_name" == "$EXPECTED_SECURITY_GROUP_NAME" ]] \
+    || die "$SERVICE security group $sg_id is '$sg_name', expected $EXPECTED_SECURITY_GROUP_NAME"
+  echo "Network: public IP $public_ip, security group $sg_id ($sg_name)"
 }
 
 # Render a task definition template with the pinned image into a temp file.
@@ -155,8 +188,7 @@ main() {
     netcfg=$(jq -c '.services[0].networkConfiguration' <<<"$svc")
     [[ "$(jq -r '.awsvpcConfiguration.subnets | length' <<<"$netcfg")" -gt 0 ]] \
       || die "$SERVICE has no awsvpc subnets; cannot place the migrate task"
-    [[ "$(jq -r '.awsvpcConfiguration.assignPublicIp' <<<"$netcfg")" == DISABLED ]] \
-      || die "$SERVICE must have assignPublicIp DISABLED (D48: internal only)"
+    require_agreed_network "$netcfg"
     local prev_image
     prev_image=$(aws ecs describe-task-definition --task-definition "$PREV_TD" --region "$REGION" \
       --query "taskDefinition.containerDefinitions[?name=='$API_CONTAINER'].image | [0]" --output text)

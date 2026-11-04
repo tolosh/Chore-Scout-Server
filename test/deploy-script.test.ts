@@ -16,7 +16,8 @@ const DIGEST = `sha256:${'a'.repeat(64)}`
 const PREV_DIGEST = `sha256:${'b'.repeat(64)}`
 const PREV_TD = 'arn:aws:ecs:ap-southeast-2:932027117528:task-definition/chore-scout-api:6'
 const NETCFG = {
-  awsvpcConfiguration: { subnets: ['subnet-0aaa', 'subnet-0bbb'], securityGroups: ['sg-0ccc'], assignPublicIp: 'DISABLED' },
+  // The agreed configuration (D48 as amended): public IP, and only chore-scout-server-sg.
+  awsvpcConfiguration: { subnets: ['subnet-0aaa', 'subnet-0bbb'], securityGroups: ['sg-0ccc'], assignPublicIp: 'ENABLED' },
 }
 const activeService = (desired = 1, status = 'ACTIVE', netcfg: object = NETCFG) =>
   JSON.stringify({
@@ -197,14 +198,89 @@ describe('deploy.sh flow (stubbed AWS)', () => {
     expect(calls().some((l) => /run-task|update-service/.test(l))).toBe(false)
   })
 
+})
+
+describe('deploy.sh agreed network configuration (D48 as amended)', () => {
+  const vpc = (over: Record<string, unknown>) => ({ awsvpcConfiguration: { subnets: ['subnet-0aaa'], ...over } })
+  const nothingChanged = () => {
+    const c = calls()
+    expect(c.some((l) => /^docker /.test(l))).toBe(false)
+    expect(c.some((l) => /ecr get-login-password|register-task-definition|run-task|update-service/.test(l))).toBe(false)
+  }
+
+  it('passes with assignPublicIp ENABLED and the single security group chore-scout-server-sg', async () => {
+    const r = await deploy(SHA, {
+      STUB_SERVICES_JSON: activeService(1, 'ACTIVE', vpc({ securityGroups: ['sg-0ccc'], assignPublicIp: 'ENABLED' })),
+    })
+    expect(r.stderr).toBe('')
+    expect(r.status).toBe(0)
+    const c = calls()
+    const lookup = c.findIndex((l) => l === 'aws ec2 describe-security-groups --group-ids sg-0ccc --region ap-southeast-2 --query SecurityGroups[0].GroupName --output text')
+    expect(lookup).toBeGreaterThanOrEqual(0)
+    expect(lookup).toBeLessThan(c.findIndex((l) => l.startsWith('docker build')))
+    expect(r.stdout).toContain('Network: public IP ENABLED, security group sg-0ccc (chore-scout-server-sg)')
+    expect(c.some((l) => l.includes('update-service'))).toBe(true)
+  })
+
   it.each([
-    ['ENABLED', { ...NETCFG, awsvpcConfiguration: { ...NETCFG.awsvpcConfiguration, assignPublicIp: 'ENABLED' } }],
-    ['absent', { awsvpcConfiguration: { subnets: ['subnet-0aaa'], securityGroups: ['sg-0ccc'] } }],
-  ])('refuses a service whose assignPublicIp is %s (D48), before building or changing anything', async (_l, netcfg) => {
+    ['DISABLED', vpc({ securityGroups: ['sg-0ccc'], assignPublicIp: 'DISABLED' }), 'assignPublicIp ENABLED (D48 as amended), got DISABLED'],
+    ['missing', vpc({ securityGroups: ['sg-0ccc'] }), 'assignPublicIp ENABLED (D48 as amended), got absent'],
+  ])('fails when assignPublicIp is %s, before any change', async (_l, netcfg, msg) => {
     const r = await deploy(SHA, { STUB_SERVICES_JSON: activeService(1, 'ACTIVE', netcfg) })
     expect(r.status).not.toBe(0)
-    expect(r.stderr).toContain('assignPublicIp DISABLED')
-    expect(calls().some((l) => /^docker|register-task-definition|run-task|update-service/.test(l.replace(/^aws /, '')))).toBe(false)
+    expect(r.stderr).toContain(msg)
+    expect(calls().some((l) => l.includes('describe-security-groups'))).toBe(false)
+    nothingChanged()
+  })
+
+  it.each([
+    ['two', ['sg-0ccc', 'sg-0ddd'], 'got 2'],
+    ['zero', [], 'got 0'],
+    ['no list of', undefined, 'got 0'],
+  ])('fails with %s security groups, before any change', async (_l, groups, msg) => {
+    const netcfg = vpc(groups === undefined ? { assignPublicIp: 'ENABLED' } : { securityGroups: groups, assignPublicIp: 'ENABLED' })
+    const r = await deploy(SHA, { STUB_SERVICES_JSON: activeService(1, 'ACTIVE', netcfg) })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain(`exactly one security group (chore-scout-server-sg), ${msg}`)
+    nothingChanged()
+  })
+
+  it.each(['default', 'odyssey-demo-sg', 'chore-scout-server-sg-old', 'CHORE-SCOUT-SERVER-SG'])(
+    'fails when the single security group is named %s, before any change',
+    async (name) => {
+      const r = await deploy(SHA, { STUB_SG_NAME: name })
+      expect(r.status).not.toBe(0)
+      expect(r.stderr).toContain(`security group sg-0ccc is '${name}', expected chore-scout-server-sg`)
+      nothingChanged()
+    },
+  )
+
+  it('fails when the security group cannot be resolved, before any change', async () => {
+    const r = await deploy(SHA, { STUB_SG_RC: '254' })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('could not resolve security group sg-0ccc')
+    nothingChanged()
+  })
+
+  it('fails on a malformed security group id without calling EC2', async () => {
+    const r = await deploy(SHA, {
+      STUB_SERVICES_JSON: activeService(1, 'ACTIVE', vpc({ securityGroups: ['sg-0ccc --dry-run'], assignPublicIp: 'ENABLED' })),
+    })
+    expect(r.status).not.toBe(0)
+    expect(r.stderr).toContain('security group id is malformed')
+    expect(calls().some((l) => l.includes('describe-security-groups'))).toBe(false)
+    nothingChanged()
+  })
+
+  it('the expected values are set once, by name, in deploy.sh', () => {
+    const src = readFileSync(SCRIPT, 'utf8')
+    expect(src.match(/^EXPECTED_ASSIGN_PUBLIC_IP=ENABLED$/gm)).toHaveLength(1)
+    expect(src.match(/^EXPECTED_SECURITY_GROUP_NAME=chore-scout-server-sg$/gm)).toHaveLength(1)
+    // Used only through the settings: no other literal comparison against the values.
+    expect(src.match(/== *"?(ENABLED|DISABLED)"?/g)).toBeNull()
+    expect(src.split('\n').filter((l) => l.includes('chore-scout-server-sg') && !l.trimStart().startsWith('#'))).toEqual([
+      'EXPECTED_SECURITY_GROUP_NAME=chore-scout-server-sg',
+    ])
   })
 })
 

@@ -26,6 +26,7 @@ const WILDCARD_OK = new Set([
   'ecr:GetAuthorizationToken',
   'ecs:RegisterTaskDefinition',
   'ecs:DescribeTaskDefinition',
+  'ec2:DescribeSecurityGroups',
   'ssmmessages:CreateControlChannel',
   'ssmmessages:CreateDataChannel',
   'ssmmessages:OpenControlChannel',
@@ -86,7 +87,12 @@ describe('IAM policies (CS-3992)', () => {
     ])
     expect(pass[0]!.Condition).toEqual({ StringEquals: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' } })
 
-    const forbidden = ['ecs:CreateService', 'ecs:DeleteService', 'ecs:StopTask', 'iam:CreateRole', 'secretsmanager:GetSecretValue']
+    // EC2: read-only, and only the security group lookup the network guard needs.
+    const ec2 = s.flatMap((x) => list(x.Action)).filter((a) => a.startsWith('ec2:'))
+    expect(ec2).toEqual(['ec2:DescribeSecurityGroups'])
+    expect(resourcesFor('ec2:DescribeSecurityGroups')).toEqual(['*'])
+
+    const forbidden = ['ec2:AuthorizeSecurityGroupIngress', 'ec2:ModifyNetworkInterfaceAttribute', 'ecs:CreateService', 'ecs:DeleteService', 'ecs:StopTask', 'iam:CreateRole', 'secretsmanager:GetSecretValue']
     for (const a of forbidden) expect(resourcesFor(a)).toEqual([])
   })
 

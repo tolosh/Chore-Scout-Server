@@ -41,6 +41,12 @@
       "Resource": "arn:aws:ecs:ap-southeast-2:932027117528:service/moroku-dsl-dev/chore-scout-api"
     },
     {
+      "Sid": "ReadSecurityGroupNamesNoResourceLevelSupport",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeSecurityGroups",
+      "Resource": "*"
+    },
+    {
       "Sid": "RunMigrateFamilyOnlyInDevCluster",
       "Effect": "Allow",
       "Action": "ecs:RunTask",
