@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Test stub for the AWS CLI (CS-3992 deploy.sh tests). Never calls AWS.
+set -euo pipefail
+echo "aws $*" >>"$STUB_DIR/calls.log"
+case "$1 $2" in
+  "ecs describe-services") echo "$STUB_SERVICES_JSON" ;;
+  "ecs describe-task-definition") echo "$STUB_PREV_IMAGE" ;;
+  "ecr get-login-password") echo "stub-ecr-token" ;;
+  "ecr describe-images")
+    if [[ "${STUB_IMAGE_EXISTS:-0}" == 1 || -f "$STUB_DIR/pushed" ]]; then
+      echo "$STUB_DIGEST"
+    else
+      echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2
+      exit 254
+    fi ;;
+  "ecs register-task-definition")
+    file=""
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == --cli-input-json ]]; then file=${2#file://}; fi
+      shift
+    done
+    family=$(jq -r .family "$file")
+    cp "$file" "$STUB_DIR/registered-$family.json"
+    printf '%s\t%s\n' "arn:aws:ecs:ap-southeast-2:932027117528:task-definition/$family:7" "$(jq -r '.containerDefinitions[0].image' "$file")" ;;
+  "ecs run-task")
+    echo '{"tasks":[{"taskArn":"arn:aws:ecs:ap-southeast-2:932027117528:task/moroku-dsl-dev/0123abcd"}],"failures":[]}' ;;
+  "ecs wait")
+    if [[ "$3" == services-stable ]]; then exit "${STUB_STABLE_RC:-0}"; fi
+    exit "${STUB_TASKS_STOPPED_RC:-0}" ;;
+  "ecs describe-tasks")
+    jq -n --argjson code "$STUB_MIGRATE_EXIT" \
+      '{tasks:[{stoppedReason:"Essential container in task exited",containers:[{name:"chore-scout-migrate",exitCode:$code}]}]}' ;;
+  "ecs update-service") jq -n --argjson d "$STUB_DESIRED" '{service:{desiredCount:$d}}' ;;
+  *) echo "aws stub: unexpected call: $*" >&2; exit 99 ;;
+esac

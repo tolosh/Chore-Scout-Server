@@ -1,0 +1,75 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrAuthTokenAccountLevel",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "PushAndDescribeOwnRepoOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:DescribeImages"
+      ],
+      "Resource": "arn:aws:ecr:ap-southeast-2:932027117528:repository/chore-scout-server"
+    },
+    {
+      "Sid": "TaskDefinitionsNoResourceLevelSupport",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:DescribeTaskDefinition"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "UpdateOneServiceOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:UpdateService"
+      ],
+      "Resource": "arn:aws:ecs:ap-southeast-2:932027117528:service/moroku-dsl-dev/chore-scout-api"
+    },
+    {
+      "Sid": "RunMigrateFamilyOnlyInDevCluster",
+      "Effect": "Allow",
+      "Action": "ecs:RunTask",
+      "Resource": "arn:aws:ecs:ap-southeast-2:932027117528:task-definition/chore-scout-migrate:*",
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": "arn:aws:ecs:ap-southeast-2:932027117528:cluster/moroku-dsl-dev"
+        }
+      }
+    },
+    {
+      "Sid": "DescribeTasksInDevClusterOnly",
+      "Effect": "Allow",
+      "Action": "ecs:DescribeTasks",
+      "Resource": "arn:aws:ecs:ap-southeast-2:932027117528:task/moroku-dsl-dev/*"
+    },
+    {
+      "Sid": "PassOnlyTheTwoServerRolesToEcsTasks",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::932027117528:role/chore-scout-server-task-role",
+        "arn:aws:iam::932027117528:role/chore-scout-server-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
