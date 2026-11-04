@@ -1,7 +1,8 @@
 name: deploy
 
 # CS-3992. Manual, digest-pinned deploy of chore-scout-server to the dev
-# cluster moroku-dsl-dev (service chore-scout-api, internal only per D48).
+# cluster moroku-dsl-dev (service chore-scout-api; D48 as amended: public
+# subnets with a public IP, only chore-scout-server-sg, no hostname or LB).
 # Run it from Actions -> deploy -> Run workflow on main. It never runs on push.
 #
 # The verify job reruns the CI checks on the exact commit. The deploy job needs

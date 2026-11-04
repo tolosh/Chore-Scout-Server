@@ -5,6 +5,12 @@ echo "aws $*" >>"$STUB_DIR/calls.log"
 case "$1 $2" in
   "ecs describe-services") echo "$STUB_SERVICES_JSON" ;;
   "ecs describe-task-definition") echo "$STUB_PREV_IMAGE" ;;
+  "ec2 describe-security-groups")
+    if [[ "${STUB_SG_RC:-0}" != 0 ]]; then
+      echo "An error occurred (InvalidGroup.NotFound) when calling the DescribeSecurityGroups operation" >&2
+      exit "$STUB_SG_RC"
+    fi
+    echo "${STUB_SG_NAME:-chore-scout-server-sg}" ;;
   "ecr get-login-password") echo "stub-ecr-token" ;;
   "ecr describe-images")
     if [[ "${STUB_IMAGE_EXISTS:-0}" == 1 || -f "$STUB_DIR/pushed" ]]; then
