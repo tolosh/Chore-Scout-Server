@@ -17,8 +17,9 @@
  *    `child` (distinct from the allowance's `split`/`automatic`), and in the
  *    same transaction donates the Give credit to the child's confirmed
  *    recipient, or holds it (§6.2). A zero Give makes no Give leg, so no donation.
- * 5. BOB refused (nothing moved): FAILED, and the debit is restored once.
- *    Unknown outcome: PENDING; the same request retried re-sends the same key.
+ * 5. BOB refused in a way that guarantees nothing moved: FAILED, and the debit
+ *    is restored once. Unknown outcome, IDEMPOTENCY_CONFLICT or IN_PROGRESS:
+ *    PENDING with the balance held; the same request re-sends the same key.
  */
 import { createHash } from 'node:crypto'
 import { MongoServerError, type Collection, type Db } from 'mongodb'
@@ -45,7 +46,7 @@ export interface SplitOperationDoc {
   expectedVersion: number
   status: 'PENDING' | 'COMPLETED' | 'FAILED'
   bobOperationRef: string | null
-  giveOutcome: { status: 'DONATED' | 'HELD' | 'NONE'; donationRef: string | null; amountCents: number } | null
+  giveOutcome: { status: 'DONATED' | 'HELD' | 'NONE'; donationRef: string | null; amountCents: number; recipient: { charityId: string; revision: number } | null } | null
   reason: string | null
   createdAt: Date
   updatedAt: Date
@@ -53,7 +54,13 @@ export interface SplitOperationDoc {
 
 const KEY_RE = /^[A-Za-z0-9._:-]{8,128}$/
 const CENTS_RE = /^(0|[1-9]\d{0,6})\.(\d{2})$/
-const FINAL = new Set(['CHILD_LIMIT', 'FORBIDDEN', 'INSUFFICIENT_FUNDS', 'VALIDATION_ERROR', 'IDEMPOTENCY_CONFLICT'])
+/**
+ * Refusals that guarantee nothing moved under this key; only these restore the
+ * unsplit balance. IDEMPOTENCY_CONFLICT is NOT one: §2.3 says only the
+ * conflicting call did nothing, and the original call under the key may have
+ * committed. It stays PENDING with the balance held (CS-3953 review R1).
+ */
+const FINAL = new Set(['CHILD_LIMIT', 'FORBIDDEN', 'INSUFFICIENT_FUNDS', 'VALIDATION_ERROR'])
 
 export const splitOpId = (childCustomerId: string, clientKey: string) =>
   `spl-${createHash('sha256').update(`${childCustomerId}:${clientKey}`).digest('hex').slice(0, 24)}`
@@ -169,13 +176,19 @@ export class SplitService {
     const now = this.now()
     if (moves.length === 0) {
       // Everything stays in Spend, where job pay already is: no BOB call.
-      await this.ops.updateOne({ idempotencyKey: op.idempotencyKey, status: 'PENDING' }, { $set: { status: 'COMPLETED', giveOutcome: { status: 'NONE', donationRef: null, amountCents: 0 }, updatedAt: now } })
+      await this.ops.updateOne({ idempotencyKey: op.idempotencyKey, status: 'PENDING' }, { $set: { status: 'COMPLETED', giveOutcome: { status: 'NONE', donationRef: null, amountCents: 0, recipient: null }, updatedAt: now } })
     } else {
       const out = await this.bob.allocate(actor.session, op.idempotencyKey, { allocationRef: op.opId, fromJar: 'spend', legs: moves })
       if (out.kind === 'ok') {
         const legsMatch =
           out.value.legs.length === moves.length && moves.every((m) => out.value.legs.some((l) => l.toJar === m.toJar && l.amountCents === m.amountCents))
-        if (!legsMatch) {
+        // The Give outcome must account for exactly the Give share (review optional 1).
+        const g0 = out.value.giveOutcome
+        const giveMatch =
+          op.shares.GIVE > 0
+            ? (g0.status === 'donated' || g0.status === 'held') && g0.amountCents === op.shares.GIVE && (g0.status !== 'donated' || (g0.donationId !== null && g0.recipient !== null))
+            : g0.status === 'none'
+        if (!legsMatch || !giveMatch) {
           await this.ops.updateOne({ idempotencyKey: op.idempotencyKey, status: 'PENDING' }, { $set: { reason: 'UPSTREAM_MISMATCH', updatedAt: now } })
         } else {
           const g = out.value.giveOutcome
@@ -185,7 +198,7 @@ export class SplitService {
               $set: {
                 status: 'COMPLETED',
                 bobOperationRef: out.value.allocationRef,
-                giveOutcome: { status: g.status === 'donated' ? 'DONATED' : g.status === 'held' ? 'HELD' : 'NONE', donationRef: g.donationId, amountCents: g.amountCents },
+                giveOutcome: { status: g.status === 'donated' ? 'DONATED' : g.status === 'held' ? 'HELD' : 'NONE', donationRef: g.donationId, amountCents: g.amountCents, recipient: g.recipient },
                 reason: null,
                 updatedAt: now,
               },

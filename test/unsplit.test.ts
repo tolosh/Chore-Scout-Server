@@ -345,3 +345,73 @@ describe('split-to-progress latency (target 1 s or less, where exercised)', () =
     await api.app.close()
   })
 })
+
+describe('review R1: IDEMPOTENCY_CONFLICT never restores the unsplit balance (bob-family/1 §2.3)', () => {
+  it('BOB commits, the answer is lost, the retry gets an injected 409: PENDING, balance held, and a new key cannot split the same money again', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const mia = bob.signIn(MIA)
+    await payJob(api, bob.signIn(SARAH), mia)
+    const v = (await unsplitOf(api, mia)).version
+    const vars = { c: MIA, legs: legs('1.00', '0.60', '0.40'), v, key: K('split-r1-a') }
+    bob.dropResponses = { re: /allocations$/, count: 1 }
+    await api.gql(mia, SPLIT, vars)
+    bob.failBefore = { re: /allocations$/, count: 1, status: 409, code: 'IDEMPOTENCY_CONFLICT' }
+    const r = (await api.gql(mia, SPLIT, vars)).body.data!.splitUnsplit as SplitOut
+    expect(r.operations[0]).toMatchObject({ status: 'PENDING', reason: 'IDEMPOTENCY_CONFLICT' })
+    expect(r.unsplit.balance.amount).toBe('0.00')
+    // The reviewer's probe: a second split under a new key.
+    const v2 = (await unsplitOf(api, mia)).version
+    expect(codeOf((await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '0.60', '0.40'), v: v2, key: K('split-r1-b') })).body)).toBe('INVALID')
+    expect(bob.balance(MIA, 'save')).toBe(60)
+    expect(allocLegs()).toHaveLength(2)
+    // Reconcile: the same request again replays BOB's original answer and completes once.
+    const done = (await api.gql(mia, SPLIT, vars)).body.data!.splitUnsplit as SplitOut
+    expect(done.operations[0]!.status).toBe('COMPLETED')
+    expect((await readLedger(db, MIA))!.balanceCents).toBe(0)
+    expect(allocLegs()).toHaveLength(2)
+    await api.app.close()
+  })
+
+  it('IDEMPOTENCY_IN_PROGRESS also stays PENDING with the balance held', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const mia = bob.signIn(MIA)
+    await payJob(api, bob.signIn(SARAH), mia)
+    const v = (await unsplitOf(api, mia)).version
+    bob.failBefore = { re: /allocations$/, count: 1, status: 409, code: 'IDEMPOTENCY_IN_PROGRESS' }
+    const r = (await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '0.60', '0.40'), v, key: K('split-r1-c') })).body.data!.splitUnsplit as SplitOut
+    expect(r.operations[0]).toMatchObject({ status: 'PENDING', reason: 'IDEMPOTENCY_IN_PROGRESS' })
+    expect(r.unsplit.balance.amount).toBe('0.00')
+    await api.app.close()
+  })
+})
+
+describe('review optional 1 and 2: the Give outcome must match the Give share; the recipient is kept', () => {
+  it.each([
+    ['a Give share answered as none', (d: Record<string, unknown>) => ((d.give_outcome as Record<string, unknown>).status = 'none')],
+    ['a Give amount that differs from the share', (d: Record<string, unknown>) => ((d.give_outcome as Record<string, unknown>).amount_cents = 39)],
+  ])('%s stays PENDING (UPSTREAM_MISMATCH) and is never COMPLETED', async (_n, mutate) => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const mia = bob.signIn(MIA)
+    await payJob(api, bob.signIn(SARAH), mia)
+    const v = (await unsplitOf(api, mia)).version
+    bob.mutateFamily = (d) => {
+      if ('allocation_ref' in d) mutate(d)
+    }
+    const r = (await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '0.60', '0.40'), v, key: K('split-o1-a') })).body.data!.splitUnsplit as SplitOut
+    expect(r.operations[0]).toMatchObject({ status: 'PENDING', reason: 'UPSTREAM_MISMATCH' })
+    expect(r.giveOutcome).toBeNull()
+    await api.app.close()
+  })
+
+  it('a donated Give keeps BOB’s recipient and revision on the operation', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const mia = bob.signIn(MIA)
+    bob.recipients.set(MIA, charity)
+    await payJob(api, bob.signIn(SARAH), mia)
+    const v = (await unsplitOf(api, mia)).version
+    await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '0.60', '0.40'), v, key: K('split-o2-a') })
+    const op = (await db.collection('money_operations').findOne({ idempotencyKey: splitKey(splitOpId(MIA, K('split-o2-a'))) }))!
+    expect(op.giveOutcome).toMatchObject({ status: 'DONATED', amountCents: 40, recipient: { charityId: charity, revision: 1 } })
+    await api.app.close()
+  })
+})

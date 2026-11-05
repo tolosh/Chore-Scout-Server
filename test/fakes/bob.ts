@@ -302,11 +302,16 @@ export function move(bob: FakeBob, from: string, to: string, amountCents: number
 }
 
 /** §6.2: a Give credit is donated at once to the confirmed recipient, or held. */
-export function sweep(bob: FakeBob, childId: string, amountCents: number, ref: string): { status: 'donated' | 'held'; donation_id?: string; amount_cents: number } {
+export function sweep(
+  bob: FakeBob,
+  childId: string,
+  amountCents: number,
+  ref: string,
+): { status: 'donated' | 'held'; donation_id?: string; amount_cents: number; recipient?: { charity_id: string; revision: number } } {
   const to = bob.recipients.get(childId)
   if (to) {
     const donation = move(bob, bob.accountOf(childId, 'give')!, to, amountCents, 'donation', ref)
-    return { status: 'donated', donation_id: donation.replace('pay_', 'don_'), amount_cents: amountCents }
+    return { status: 'donated', donation_id: donation.replace('pay_', 'don_'), amount_cents: amountCents, recipient: { charity_id: to, revision: 1 } }
   }
   bob.held.set(childId, (bob.held.get(childId) ?? 0) + amountCents)
   bob.ledger.push({ paymentId: newId('pay'), purpose: 'give_unresolved', from: bob.accountOf(childId, 'give')!, to: bob.accountOf(childId, 'give')!, amountCents, ref })

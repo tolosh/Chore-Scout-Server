@@ -95,6 +95,7 @@ const allocation = z.object({
     status: z.enum(['donated', 'held', 'none']),
     donation_id: id.optional(),
     amount_cents: z.number().int().nonnegative().optional(),
+    recipient: z.object({ charity_id: id, revision: z.number().int().nonnegative() }).optional(),
   }),
 })
 
@@ -107,7 +108,7 @@ export interface AllocationInput {
 export interface Allocation {
   allocationRef: string
   legs: { legId: string; toJar: BobJar; amountCents: number }[]
-  giveOutcome: { status: 'donated' | 'held' | 'none'; donationId: string | null; amountCents: number }
+  giveOutcome: { status: 'donated' | 'held' | 'none'; donationId: string | null; amountCents: number; recipient: { charityId: string; revision: number } | null }
 }
 
 export class BobFamilyClient {
@@ -169,7 +170,12 @@ export class BobFamilyClient {
     return parsed(o, allocation, (d) => ({
       allocationRef: d.allocation_ref,
       legs: d.legs.map((l) => ({ legId: l.leg_id, toJar: l.to_jar, amountCents: l.amount_cents })),
-      giveOutcome: { status: d.give_outcome.status, donationId: d.give_outcome.donation_id ?? null, amountCents: d.give_outcome.amount_cents ?? 0 },
+      giveOutcome: {
+        status: d.give_outcome.status,
+        donationId: d.give_outcome.donation_id ?? null,
+        amountCents: d.give_outcome.amount_cents ?? 0,
+        recipient: d.give_outcome.recipient ? { charityId: d.give_outcome.recipient.charity_id, revision: d.give_outcome.recipient.revision } : null,
+      },
     }))
   }
 }
