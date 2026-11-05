@@ -136,15 +136,18 @@ type CsSetupSlot {
   slot: Int!
   state: CsSetupSlotState!
   childCustomerId: ID
-  "Per-slot reason when REFUSED, e.g. email already used in this bank (ID-12)."
+  "BOB's code when REFUSED (EMAIL_IN_USE, AGE_OUT_OF_RANGE, VALIDATION_ERROR; final for this setupRef). While PENDING: UPSTREAM_UNAVAILABLE, or IDEMPOTENCY_CONFLICT when a retry changed this child's details (resend the original details)."
   reason: String
 }
 
 type CsFamilySetup {
   setupRef: ID!
+  "PARTIAL with resumable true: retry with the same setupRef. COMPLETE, or PARTIAL with resumable false: settled (CS-3948)."
   state: CsFamilySetupState!
   slots: [CsSetupSlot!]!
   familyId: ID
+  "True while any slot is PENDING (not tried, or BOB's outcome unknown). Only Sarah's retry resumes it; there is no background completion."
+  resumable: Boolean!
 }
 
 "Passed to BOB's create-linked-child under the Guardian's session. The server does not store contact details."

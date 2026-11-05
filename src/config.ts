@@ -35,7 +35,7 @@ export const SECRET_KEYS = ['MONGODB_URI', 'BOB_ALLOWANCE_CREDENTIAL'] as const
 export const ALLOWED_BOB_KEYS = new Set<string>(['BOB_ALLOWANCE_CREDENTIAL'])
 
 /** BOB keys that are not credentials. Each is validated so it cannot carry one. */
-export const NON_CREDENTIAL_BOB_KEYS = new Set<string>(['BOB_API_URL'])
+export const NON_CREDENTIAL_BOB_KEYS = new Set<string>(['BOB_API_URL', 'BOB_CALL_TIMEOUT_MS'])
 
 /** An http(s) origin plus optional path, with no userinfo, query or fragment. */
 export function credentialFreeUrl(v: string): boolean {
@@ -97,6 +97,8 @@ const base = z.object({
   // Session check (contract bob-session/1 §6): cache at most 30 s; 0 disables the cache.
   SESSION_CHECK_TIMEOUT_MS: intFrom('SESSION_CHECK_TIMEOUT_MS', 2_000, 100, 30_000),
   SESSION_CACHE_TTL_MS: intFrom('SESSION_CACHE_TTL_MS', 30_000, 0, 30_000),
+  // Timeout for bob-family/1 calls (CS-3948 onwards). A timeout leaves money calls PENDING for a same-key retry.
+  BOB_CALL_TIMEOUT_MS: intFrom('BOB_CALL_TIMEOUT_MS', 4_000, 100, 30_000),
 })
 
 const jobsExtra = z.object({
