@@ -91,6 +91,8 @@ export class FakeBob {
   clock: () => Date = () => new Date()
   /** Mutates a 200 body before it is sent (contract-violation tests). */
   mutate: ((data: Record<string, unknown>) => void) | null = null
+  /** Mutates a 2xx bob-family/1 response's data as sent (contract-violation tests). BOB's own state is unchanged. */
+  mutateFamily: ((data: Record<string, unknown>) => void) | null = null
 
   addAdult(customerId: string, bank: Bank = 'bank_bilgola'): this {
     this.people.set(customerId, { customerId, bank, kind: 'adult' })
@@ -240,7 +242,12 @@ export class FakeBob {
       throw new TypeError('fetch failed (response lost after BOB committed)')
     }
     const status = replay && result.status === 201 ? 200 : result.status
-    const res = json(status, result.body)
+    let sent = result.body
+    if (this.mutateFamily && status >= 200 && status < 300) {
+      sent = structuredClone(result.body) as { data: Record<string, unknown> }
+      this.mutateFamily((sent as { data: Record<string, unknown> }).data)
+    }
+    const res = json(status, sent)
     if (replay) res.headers.set('x-idempotency-replay', 'true')
     return res
   }

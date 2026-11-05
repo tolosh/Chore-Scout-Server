@@ -86,7 +86,12 @@ export interface MoneyOperationDoc {
 
 export const jobOpId = (jobId: string) => `job-${jobId}`
 export const jobPaymentKey = (jobId: string) => `cs:${jobOpId(jobId)}:job`
-const FINAL_PAY_REFUSALS = new Set(['FORBIDDEN', 'INSUFFICIENT_FUNDS', 'VALIDATION_ERROR', 'IDEMPOTENCY_CONFLICT'])
+/**
+ * Refusals that guarantee nothing moved under this key. IDEMPOTENCY_CONFLICT is
+ * NOT one: §2.3 says only the conflicting call did nothing, and the original
+ * call under the key may have paid. It stays PENDING (CS-3949 review R2).
+ */
+const FINAL_PAY_REFUSALS = new Set(['FORBIDDEN', 'INSUFFICIENT_FUNDS', 'VALIDATION_ERROR'])
 const KEY_RE = /^[A-Za-z0-9._:-]{8,128}$/
 const MAX_POINTS = 10_000
 
@@ -270,6 +275,9 @@ export class JobService {
     assertGuardianOf(actor.principal, job.childCustomerId)
     if (job.version !== expectedVersion) throw stale()
     if (job.status !== 'APPROVED_PAYMENT_PENDING') throw notAllowedInState(`no payment pending for a job in ${job.status}`)
+    // §5, §9.1: only the approving Guardian's own session pays (CS-3949 review R1).
+    const op = job.paymentKey ? await this.ops.findOne({ idempotencyKey: job.paymentKey }, { projection: { _id: 0, actorCustomerId: 1 } }) : null
+    if (op && op.actorCustomerId !== actor.principal.customerId) throw forbidden('only the Guardian who approved this job can retry its payment')
     return this.settle(actor, job, correlation)
   }
 
@@ -295,7 +303,11 @@ export class JobService {
       await this.ops.insertOne({ ...op })
     } catch (err) {
       if (!(err instanceof MongoServerError && err.code === 11000)) throw err
-      // A concurrent approval already recorded the one payment for this job.
+      // A concurrent approval already recorded the one payment for this job. It
+      // may go ahead only if it is the same Guardian paying from the same
+      // account; otherwise it lost the race (CS-3949 review R1).
+      const stored = await this.ops.findOne({ idempotencyKey: op.idempotencyKey }, { projection: { _id: 0, actorCustomerId: 1, fromAccountId: 1 } })
+      if (!stored || stored.actorCustomerId !== op.actorCustomerId || stored.fromAccountId !== fromAccountId) throw stale()
     }
   }
 
@@ -306,7 +318,9 @@ export class JobService {
    */
   private async settle(actor: Actor, job: JobDoc, correlation: string): Promise<DecisionResult> {
     let op = job.paymentKey ? await this.ops.findOne({ idempotencyKey: job.paymentKey }, { projection: { _id: 0 } }) : null
-    if (op && op.status === 'PENDING' && job.status === 'APPROVED_PAYMENT_PENDING') {
+    // BOB is called only under the session of the Guardian who recorded the payment (§5, §9.1;
+    // CS-3949 review R1). Anyone else sees the current state and nothing is sent.
+    if (op && op.status === 'PENDING' && job.status === 'APPROVED_PAYMENT_PENDING' && op.actorCustomerId === actor.principal.customerId) {
       const out = await this.bob.payJob(actor.session, op.idempotencyKey, {
         childCustomerId: op.childCustomerId,
         jobRef: op.jobId,
@@ -317,7 +331,10 @@ export class JobService {
       const now = this.now()
       if (out.kind === 'ok' || (out.kind === 'refused' && out.code === 'JOB_ALREADY_PAID')) {
         const ref = out.kind === 'ok' ? out.value.paymentId : String(out.error.payment_id ?? '')
-        if (out.kind === 'ok' && (out.value.amountCents !== op.amountCents || out.value.childCustomerId !== op.childCustomerId)) {
+        if (
+          out.kind === 'ok' &&
+          (out.value.amountCents !== op.amountCents || out.value.childCustomerId !== op.childCustomerId || out.value.jobRef !== op.jobId || out.value.fromAccountId !== op.fromAccountId)
+        ) {
           // Outside the contract: never mark PAID on an answer that doesn't match what we asked for.
           await this.ops.updateOne({ idempotencyKey: op.idempotencyKey, status: 'PENDING' }, { $set: { reason: 'UPSTREAM_MISMATCH', updatedAt: now }, $inc: { attempts: 1 } })
         } else {

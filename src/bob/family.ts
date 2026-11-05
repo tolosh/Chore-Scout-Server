@@ -53,6 +53,7 @@ const jobPayment = z.object({
   purpose: z.literal('job'),
   job_ref: id,
   child_customer_id: id,
+  from_account_id: id,
   amount_cents: z.number().int().positive(),
   currency: z.literal('AUD'),
 })
@@ -69,6 +70,7 @@ export interface JobPayment {
   paymentId: string
   jobRef: string
   childCustomerId: string
+  fromAccountId: string
   amountCents: number
 }
 
@@ -111,6 +113,6 @@ export class BobFamilyClient {
       idempotencyKey,
       body: { job_ref: input.jobRef, from_account_id: input.fromAccountId, amount_cents: input.amountCents, currency: 'AUD', description: input.description },
     })
-    return parsed(o, jobPayment, (d) => ({ paymentId: d.payment_id, jobRef: d.job_ref, childCustomerId: d.child_customer_id, amountCents: d.amount_cents }))
+    return parsed(o, jobPayment, (d) => ({ paymentId: d.payment_id, jobRef: d.job_ref, childCustomerId: d.child_customer_id, fromAccountId: d.from_account_id, amountCents: d.amount_cents }))
   }
 }

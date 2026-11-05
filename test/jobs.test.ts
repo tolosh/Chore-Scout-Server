@@ -365,3 +365,118 @@ describe('the unsplit ledger accepts only completed job pay', () => {
     await expect(creditFromJobPayment(db, { ...bad, kind: 'job', status: 'PENDING' } as never, new Date())).rejects.toThrow(/only completed job pay/)
   })
 })
+
+describe('review R1: only the approving Guardian’s session pays (bob-family/1 §5, §9.1)', () => {
+  const DAD = 'cust_T_DAD'
+  const linkDad = () => {
+    bob.addAdult(DAD).link(DAD, MIA)
+    return bob.openAccount(DAD, 'funding', 10_000)
+  }
+
+  it('Dad retrying Sarah’s pending payment is refused with no BOB call; Sarah’s retry pays once', async () => {
+    linkDad()
+    const api = buildTestApi({ db, bob, now: () => t })
+    const sarah = bob.signIn(SARAH)
+    const dad = bob.signIn(DAD)
+    const w = await waitingJob(api, sarah, bob.signIn(MIA))
+    bob.dropResponses = { re: /job-payments$/, count: 1 }
+    const d = (await api.gql(sarah, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r1-a', f: funding })).body.data!.decideJob as { job: Job }
+    expect(d.job.status).toBe('APPROVED_PAYMENT_PENDING')
+    const calls = payCalls().length
+    expect(codeOf((await api.gql(dad, RETRY, { j: w.jobId, v: d.job.version, key: 'retry-r1-dad' })).body)).toBe('FORBIDDEN')
+    expect(payCalls().length).toBe(calls) // no BOB call under Dad’s session
+    const after = (await api.gql(sarah, `query { jobs(childId: "${MIA}") { jobId status payment { status } } }`)).body.data!.jobs as { status: string; payment: { status: string } }[]
+    expect(after[0]).toMatchObject({ status: 'APPROVED_PAYMENT_PENDING', payment: { status: 'PENDING' } })
+    const r = (await api.gql(sarah, RETRY, { j: w.jobId, v: d.job.version, key: 'retry-r1-sarah' })).body.data!.retryJobPayment as { job: Job }
+    expect(r.job.status).toBe('PAID')
+    expect(payCalls().every((c) => c.bearer === sarah)).toBe(true)
+    expect(jobLegs()).toHaveLength(1)
+    expect(await unsplitCents()).toBe(200)
+    await api.app.close()
+  })
+
+  it('Dad replaying Sarah’s decide key sees the state, and nothing is sent under his session', async () => {
+    linkDad()
+    const api = buildTestApi({ db, bob, now: () => t })
+    const sarah = bob.signIn(SARAH)
+    const dad = bob.signIn(DAD)
+    const w = await waitingJob(api, sarah, bob.signIn(MIA))
+    bob.dropResponses = { re: /job-payments$/, count: 1 }
+    await api.gql(sarah, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r1-b', f: funding })
+    const d = (await api.gql(dad, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r1-b', f: funding })).body.data!.decideJob as { job: Job }
+    expect(d.job.status).toBe('APPROVED_PAYMENT_PENDING')
+    expect(payCalls().filter((c) => c.bearer === dad)).toHaveLength(0)
+    await api.app.close()
+  })
+
+  it('a concurrent second approval by Dad from his own account: the stored operation is Sarah’s, so Dad gets STALE_VERSION and pays nothing', async () => {
+    const dadFunding = linkDad()
+    const api = buildTestApi({ db, bob, now: () => t })
+    const sarah = bob.signIn(SARAH)
+    const dad = bob.signIn(DAD)
+    const w = await waitingJob(api, sarah, bob.signIn(MIA))
+    const rs = await Promise.all([
+      api.gql(sarah, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r1-c1', f: funding }),
+      api.gql(dad, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r1-c2', f: dadFunding }),
+    ])
+    const codes = rs.map((r) => codeOf(r.body) ?? (r.body.data!.decideJob as { job: Job }).job.status)
+    expect(codes.filter((c) => c === 'PAID')).toHaveLength(1)
+    expect(codes.filter((c) => c === 'STALE_VERSION')).toHaveLength(1)
+    expect(jobLegs()).toHaveLength(1)
+    // Whoever recorded the operation is whoever BOB was called as.
+    const op = (await db.collection('money_operations').findOne({ idempotencyKey: jobPaymentKey(w.jobId) }))!
+    expect(payCalls().map((c) => c.bearer)).toEqual([op.actorCustomerId === SARAH ? sarah : dad])
+    await api.app.close()
+  })
+
+  it('the same Guardian approving twice from a different account after the operation is recorded gets STALE_VERSION', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const sarah = bob.signIn(SARAH)
+    const w = await waitingJob(api, sarah, bob.signIn(MIA))
+    const other = bob.openAccount(SARAH, 'funding', 10_000)
+    // The operation for this job is recorded first, from Sarah’s funding account (as a crashed earlier approval would leave it).
+    await db.collection('money_operations').insertOne({
+      idempotencyKey: jobPaymentKey(w.jobId), opId: 'op-r1-d', kind: 'job', tenantId: 'bank_bilgola', jobId: w.jobId, childCustomerId: MIA, actorCustomerId: SARAH,
+      fromAccountId: funding, amountCents: 200, status: 'PENDING', bobOperationRef: null, reason: null, attempts: 0, createdAt: new Date(t), updatedAt: new Date(t),
+    })
+    expect(codeOf((await api.gql(sarah, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r1-d', f: other })).body)).toBe('STALE_VERSION')
+    expect(payCalls()).toHaveLength(0)
+    await api.app.close()
+  })
+})
+
+describe('review R2: IDEMPOTENCY_CONFLICT is not final (bob-family/1 §2.3)', () => {
+  it('BOB commits, the answer is lost, the retry gets an injected 409: PENDING with the reason, never PAYMENT_FAILED; a later retry is PAID once', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const sarah = bob.signIn(SARAH)
+    const w = await waitingJob(api, sarah, bob.signIn(MIA))
+    bob.dropResponses = { re: /job-payments$/, count: 1 }
+    const d = (await api.gql(sarah, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-r2-a', f: funding })).body.data!.decideJob as { job: Job }
+    bob.failBefore = { re: /job-payments$/, count: 1, status: 409, code: 'IDEMPOTENCY_CONFLICT' }
+    const r1 = (await api.gql(sarah, RETRY, { j: w.jobId, v: d.job.version, key: 'retry-r2-a' })).body.data!.retryJobPayment as { job: Job; payment: { status: string; reason: string } }
+    expect(r1.job.status).toBe('APPROVED_PAYMENT_PENDING')
+    expect(r1.payment).toEqual({ status: 'PENDING', reason: 'IDEMPOTENCY_CONFLICT' })
+    expect(bob.balance(MIA, 'spend')).toBe(200) // the original call did pay
+    const r2 = (await api.gql(sarah, RETRY, { j: w.jobId, v: r1.job.version, key: 'retry-r2-b' })).body.data!.retryJobPayment as { job: Job }
+    expect(r2.job.status).toBe('PAID')
+    expect(jobLegs()).toHaveLength(1)
+    expect(await unsplitCents()).toBe(200)
+    await api.app.close()
+  })
+})
+
+describe('review optional 1: a 201 for another job or source account is never marked PAID', () => {
+  it('a mismatched from_account_id stays PENDING (UPSTREAM_MISMATCH)', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const sarah = bob.signIn(SARAH)
+    const w = await waitingJob(api, sarah, bob.signIn(MIA))
+    bob.mutateFamily = (data) => {
+      if ('job_ref' in data) data.from_account_id = 'acc_T_SOMEONE_ELSE'
+    }
+    const d = (await api.gql(sarah, DECIDE, { j: w.jobId, d: 'APPROVE', v: w.version, key: 'decide-o1-a', f: funding })).body.data!.decideJob as { job: Job; payment: { status: string; reason: string } }
+    expect(d.job.status).toBe('APPROVED_PAYMENT_PENDING')
+    expect(d.payment).toEqual({ status: 'PENDING', reason: 'UPSTREAM_MISMATCH' })
+    expect(await unsplitCents()).toBe(0)
+    await api.app.close()
+  })
+})
