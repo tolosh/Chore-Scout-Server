@@ -78,6 +78,21 @@ export interface JobPayment {
 
 export type BobJar = 'spend' | 'save' | 'give'
 
+/**
+ * A child's own jar moves (bob-family/1 §6.1 as amended by D52, CS-3943 comment
+ * 39909): Spend→Save, Spend→Give, Save→Spend and Save→Give. Nothing leaves Give
+ * (ID-4). Every move into Give goes through this allocations route, so BOB's
+ * §6.2 sweep applies (D51): it donates only to the child's confirmed recipient,
+ * otherwise it holds the money.
+ */
+export const CHILD_JAR_MOVES: readonly (readonly [BobJar, BobJar])[] = [
+  ['spend', 'save'],
+  ['spend', 'give'],
+  ['save', 'spend'],
+  ['save', 'give'],
+]
+export const isChildJarMove = (from: BobJar, to: BobJar) => CHILD_JAR_MOVES.some(([f, t]) => f === from && t === to)
+
 const allocation = z.object({
   allocation_ref: id,
   status: z.literal('completed'),
@@ -160,6 +175,10 @@ export class BobFamilyClient {
    * the Give sweep or hold (§6.2) in the same transaction. Key `cs:<splitOpId>:split`.
    */
   async allocate(session: SessionToken, idempotencyKey: string, input: AllocationInput): Promise<Outcome<Allocation>> {
+    // Fail closed before BOB on a move outside the child's set (D52); nothing is sent.
+    if (input.legs.length === 0 || input.legs.some((l) => !isChildJarMove(input.fromJar, l.toJar))) {
+      throw new Error(`not a child jar move: ${input.fromJar} -> ${input.legs.map((l) => l.toJar).join(',') || '(none)'}`)
+    }
     const o = await this.http.send({
       method: 'POST',
       path: '/api/v1/children/me/allocations',

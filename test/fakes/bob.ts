@@ -331,7 +331,8 @@ export function installFamilyRoutes(bob: FakeBob): void {
     const to = b.legs.map((l) => String(l.to_jar))
     if (new Set(to).size !== to.length || to.some((j) => !jars.includes(j) || j === b.from_jar)) return err(400, 'VALIDATION_ERROR')
     if (b.legs.some((l) => !Number.isInteger(l.amount_cents) || (l.amount_cents as number) <= 0)) return err(400, 'VALIDATION_ERROR')
-    const allowed = (f: string, t: string) => (f === 'spend' && (t === 'save' || t === 'give')) || (f === 'save' && t === 'spend')
+    // §6.1 as amended by D52: Save→Give is allowed; a Give leg from either jar runs the §6.2 sweep.
+    const allowed = (f: string, t: string) => (f === 'spend' && (t === 'save' || t === 'give')) || (f === 'save' && (t === 'spend' || t === 'give'))
     if (to.some((t) => !allowed(String(b.from_jar), t))) return err(400, 'VALIDATION_ERROR')
     const fromAcct = bob.accountOf(childId, b.from_jar as 'spend')!
     const total = b.legs.reduce((n, l) => n + (l.amount_cents as number), 0)

@@ -4,6 +4,8 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { Db } from 'mongodb'
+import { isChildJarMove } from '../src/bob/family.js'
+import { SessionToken } from '../src/identity/principal.js'
 import { runMigrations } from '../src/migrations/index.js'
 import { readLedger } from '../src/unsplit/ledger.js'
 import { splitKey, splitOpId } from '../src/unsplit/split.js'
@@ -412,6 +414,54 @@ describe('review optional 1 and 2: the Give outcome must match the Give share; t
     await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '0.60', '0.40'), v, key: K('split-o2-a') })
     const op = (await db.collection('money_operations').findOne({ idempotencyKey: splitKey(splitOpId(MIA, K('split-o2-a'))) }))!
     expect(op.giveOutcome).toMatchObject({ status: 'DONATED', amountCents: 40, recipient: { charityId: charity, revision: 1 } })
+    await api.app.close()
+  })
+})
+
+describe('D52: Save→Give is a child allocation choice, through §6.1 so the D51 sweep applies', () => {
+  const fund = (cents: number) => {
+    bob.accounts.get(bob.accountOf(MIA, 'save')!)!.balance = cents
+  }
+
+  it('the move set is Spend→Save, Spend→Give, Save→Spend and Save→Give; nothing leaves Give', () => {
+    expect(isChildJarMove('save', 'give')).toBe(true)
+    expect(isChildJarMove('spend', 'save') && isChildJarMove('spend', 'give') && isChildJarMove('save', 'spend')).toBe(true)
+    expect(isChildJarMove('give', 'save') || isChildJarMove('give', 'spend') || isChildJarMove('spend', 'spend')).toBe(false)
+  })
+
+  it('Save→Give with a confirmed recipient donates exactly that credit under the child’s session', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    bob.recipients.set(MIA, charity)
+    fund(100)
+    const out = await api.ports.family.allocate(new SessionToken(bob.signIn(MIA)), K('cs:d52-a:split'), { allocationRef: 'spl_d52a', fromJar: 'save', legs: [{ toJar: 'give', amountCents: 40 }] })
+    expect(out.kind).toBe('ok')
+    if (out.kind !== 'ok') throw new Error('unreachable')
+    expect(out.value.giveOutcome).toMatchObject({ status: 'donated', amountCents: 40, recipient: { charityId: charity, revision: 1 } })
+    expect(allocCalls()).toHaveLength(1)
+    expect(allocCalls()[0]!.body).toMatchObject({ from_jar: 'save', legs: [{ to_jar: 'give', amount_cents: 40 }] })
+    expect(allocLegs()).toEqual([expect.objectContaining({ purpose: 'allocation', origin: 'child', amountCents: 40 })])
+    expect(bob.ledger.filter((l) => l.purpose === 'donation').map((l) => l.amountCents)).toEqual([40])
+    expect(bob.balance(MIA, 'save')).toBe(60)
+    await api.app.close()
+  })
+
+  it('Save→Give with no confirmed recipient is held (HOLD-1); nothing is donated', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    fund(100)
+    const out = await api.ports.family.allocate(new SessionToken(bob.signIn(MIA)), K('cs:d52-b:split'), { allocationRef: 'spl_d52b', fromJar: 'save', legs: [{ toJar: 'give', amountCents: 40 }] })
+    expect(out.kind === 'ok' && out.value.giveOutcome.status).toBe('held')
+    expect(bob.held.get(MIA)).toBe(40)
+    expect(bob.balance(MIA, 'give')).toBe(40)
+    expect(bob.ledger.filter((l) => l.purpose === 'donation')).toHaveLength(0)
+    await api.app.close()
+  })
+
+  it('a move out of Give, or to the same jar, is refused before BOB: no call is sent', async () => {
+    const api = buildTestApi({ db, bob, now: () => t })
+    const s = new SessionToken(bob.signIn(MIA))
+    await expect(api.ports.family.allocate(s, K('cs:d52-c:split'), { allocationRef: 'spl_d52c', fromJar: 'give', legs: [{ toJar: 'save', amountCents: 1 }] })).rejects.toThrow(/not a child jar move/)
+    await expect(api.ports.family.allocate(s, K('cs:d52-d:split'), { allocationRef: 'spl_d52d', fromJar: 'save', legs: [{ toJar: 'save', amountCents: 1 }] })).rejects.toThrow(/not a child jar move/)
+    expect(allocCalls()).toHaveLength(0)
     await api.app.close()
   })
 })
