@@ -84,6 +84,46 @@ export async function markUnavailable(db: Db, childCustomerId: string, now: Date
   await db.collection<CharityPreferenceDoc>(PREFERENCES).updateOne(filter, { $set: { availability: 'UNAVAILABLE', updatedAt: now } })
 }
 
+/**
+ * A Give credit BOB donated tells the server which recipient BOB actually has
+ * for the child (bob-family/1 §6.1, §6.2). Reconcile with it so the server's
+ * charity stays the one BOB sweeps to (D51):
+ * - it is the pending choice, whose answer was lost: BOB recorded it, so it is
+ *   settled as CONFIRMED (the child made this choice; nothing is invented);
+ * - it is the confirmed choice, shown UNAVAILABLE after an earlier hold: BOB
+ *   resolved it again, so it is AVAILABLE again;
+ * - it is neither: drift. It is audited, and nothing is replaced silently.
+ * Conditional single-document updates only (DocumentDB); moves no money.
+ */
+export async function reconcileWithSweep(
+  db: Db,
+  childCustomerId: string,
+  tenantId: string,
+  recipient: { charityId: string; revision: number },
+  now: Date,
+  correlation: string,
+): Promise<void> {
+  const prefs = db.collection<CharityPreferenceDoc>(PREFERENCES)
+  const d = await prefs.findOne({ childCustomerId }, { projection: { _id: 0 } })
+  if (d && d.tenantId !== tenantId) return
+  const before = d ? { bobCharityId: d.bobCharityId, revision: d.revision, availability: availabilityOf(d), pending: d.pending?.bobCharityId ?? null } : null
+  if (d?.pending && d.pending.bobCharityId === recipient.charityId) {
+    const r = await prefs.updateOne(
+      { childCustomerId, 'pending.key': d.pending.key, 'writes.key': d.pending.key },
+      { $set: { bobCharityId: recipient.charityId, revision: recipient.revision, confirmedAt: now, availability: 'AVAILABLE', pending: null, 'writes.$.outcome': 'CONFIRMED', updatedAt: now } },
+    )
+    if (r.modifiedCount === 1) {
+      await audit(db, { actor: 'bob-sweep', tenantId, action: 'giving.preference_confirmed_by_sweep', subject: childCustomerId, before, after: { bobCharityId: recipient.charityId, revision: recipient.revision, key: d.pending.key }, correlation }, now)
+    }
+    return
+  }
+  if (d && d.bobCharityId === recipient.charityId) {
+    await prefs.updateOne({ childCustomerId, bobCharityId: recipient.charityId, availability: 'UNAVAILABLE' }, { $set: { availability: 'AVAILABLE', updatedAt: now } })
+    return
+  }
+  await audit(db, { actor: 'bob-sweep', tenantId, action: 'giving.recipient_drift', subject: childCustomerId, before, after: { bobCharityId: recipient.charityId, revision: recipient.revision }, correlation }, now)
+}
+
 export class CharityPreferenceService {
   private readonly prefs: Collection<CharityPreferenceDoc>
 

@@ -18,7 +18,7 @@ export const givingResolvers: ResolverMap = {
       const p = ctx.actor.principal
       assertChildAccess(p, a.childId)
       const pref = await readPreference(ctx.db, a.childId, p.tenantId)
-      return { childCustomerId: a.childId, availability: availabilityOf(pref), preference: preferenceToGraph(pref) }
+      return { childCustomerId: a.childId, availability: availabilityOf(pref), preference: preferenceToGraph(pref), confirmingBobCharityId: pref?.pending?.bobCharityId ?? null }
     },
   },
   CsGiving: {

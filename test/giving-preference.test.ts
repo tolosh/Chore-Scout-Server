@@ -267,3 +267,54 @@ describe('T7: no routing fields reach a payload or a log', () => {
     await api.app.close()
   })
 })
+
+describe('D51: the server’s charity follows what BOB sweeps to', () => {
+  const GIVING2 = `query($c: ID!) { giving(childId: $c) { availability confirmingBobCharityId preference { bobCharityId availability } } }`
+  type G2 = { availability: string; confirmingBobCharityId: string | null; preference: { bobCharityId: string; availability: string } | null }
+  const g2 = async (api: ReturnType<typeof buildTestApi>, tok: string) => (await api.gql(tok, GIVING2, { c: LEO })).body.data!.giving as G2
+  const auditOf = (action: string) => db.collection('audit').find({ action }).toArray()
+
+  it('a lost answer: BOB recorded the choice and its next sweep donates there, so the server settles it as confirmed', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    bob.dropResponses = { re: /give-recipient$/, count: 1 }
+    expect(codeOf((await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-d51-01') })).body)).toBe('UPSTREAM_UNAVAILABLE')
+    expect(await g2(api, leo)).toEqual({ availability: 'NONE_SELECTED', confirmingBobCharityId: PAWS, preference: null })
+    expect((await payAndSplit(api, '0.40', 51)).status).toBe('DONATED')
+    expect(bob.balance(PAWS, 'spend')).toBe(40)
+    expect(await g2(api, leo)).toEqual({ availability: 'AVAILABLE', confirmingBobCharityId: null, preference: { bobCharityId: PAWS, availability: 'AVAILABLE' } })
+    expect(await auditOf('giving.preference_confirmed_by_sweep')).toHaveLength(1)
+    const puts = putCalls().length
+    const r = await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-d51-01') })
+    expect(r.body.data!.setCharityPreference).toMatchObject({ bobCharityId: PAWS, version: 1, availability: 'AVAILABLE' })
+    expect(putCalls()).toHaveLength(puts) // the replay sends nothing
+    await api.app.close()
+  })
+
+  it('a confirmed charity shown UNAVAILABLE after a hold is AVAILABLE again once BOB donates to it', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-d51-02') })
+    bob.charities.get(PAWS)!.enabled = false
+    expect((await payAndSplit(api, '0.40', 52)).status).toBe('HELD')
+    expect((await g2(api, leo)).availability).toBe('UNAVAILABLE')
+    bob.charities.get(PAWS)!.enabled = true
+    expect((await payAndSplit(api, '0.30', 53)).status).toBe('DONATED')
+    expect(await g2(api, leo)).toMatchObject({ availability: 'AVAILABLE', preference: { bobCharityId: PAWS } })
+    expect(bob.held.get(LEO)).toBe(40) // the earlier hold stays held (HOLD-2)
+    await api.app.close()
+  })
+
+  it('BOB donating to a charity the server didn’t confirm is audited as drift, with no silent replacement', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-d51-03') })
+    bob.recipients.set(LEO, { charityId: TREES, revision: 1 })
+    expect((await payAndSplit(api, '0.40', 54)).status).toBe('DONATED')
+    expect((await g2(api, leo)).preference).toEqual({ bobCharityId: PAWS, availability: 'AVAILABLE' })
+    const drift = await auditOf('giving.recipient_drift')
+    expect(drift).toHaveLength(1)
+    expect(drift[0]).toMatchObject({ subject: LEO, after: { bobCharityId: TREES, revision: 1 } })
+    await api.app.close()
+  })
+})

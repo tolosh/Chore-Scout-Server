@@ -430,6 +430,12 @@ type CsGiving {
   "NONE_SELECTED when preference is null."
   availability: CsCharityAvailability!
   preference: CsCharityPreference
+  """
+  A choice the child made that BOB hasn't confirmed yet (its answer was lost).
+  Until it settles, BOB may sweep Give to this charity or to the one in
+  preference. Null when nothing is being confirmed.
+  """
+  confirmingBobCharityId: ID
   heldGiving: CsHeldGiveReview
   donations: [CsDonation!]!
 }
