@@ -619,6 +619,8 @@ type Mutation {
     linkedCondition: CsLinkedCondition
     expectedVersion: Int
     idempotencyKey: ID!
+    "The Guardian's own funding account for the standing authority (bob-family/1 §7.1). Required on first set-up; omit to keep it."
+    fromAccountId: ID
   ): CsAllowanceRule!
 
   "Guardian only, for a linked child (CS-3949). A good deed carries points only; other kinds carry a reward (a HOME_JOB chore may have none)."
