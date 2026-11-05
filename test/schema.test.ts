@@ -35,7 +35,8 @@ describe('schema/chorescout.v1.graphql', () => {
       ['viewer', 'family', 'child', 'allowance', 'jobs', 'approvals', 'unsplit', 'giving', 'goals', 'capabilities', 'card', 'demoMerchants', 'publishedTheme', 'familySetup', 'changes'].sort(),
     )
     expect(Object.keys(mutation.getFields()).sort()).toEqual(
-      ['startFamilySetup', 'setAllowance', 'submitJob', 'decideJob', 'splitUnsplit', 'setCharityPreference', 'confirmHeldRelease', 'decideUnlock', 'purchase', 'setSavingsBoost'].sort(),
+      // Spec §6, plus createJob and retryJobPayment (CS-3949: jobs must be created; payments retried under a live session).
+      ['startFamilySetup', 'setAllowance', 'createJob', 'submitJob', 'decideJob', 'retryJobPayment', 'splitUnsplit', 'setCharityPreference', 'confirmHeldRelease', 'decideUnlock', 'purchase', 'setSavingsBoost'].sort(),
     )
   })
 
@@ -49,7 +50,7 @@ describe('schema/chorescout.v1.graphql', () => {
   })
 
   it('mutations on stale-able state take an expected version', () => {
-    for (const name of ['setAllowance', 'submitJob', 'decideJob', 'splitUnsplit', 'setCharityPreference', 'decideUnlock', 'setSavingsBoost']) {
+    for (const name of ['setAllowance', 'submitJob', 'decideJob', 'retryJobPayment', 'splitUnsplit', 'setCharityPreference', 'decideUnlock', 'setSavingsBoost']) {
       expect(mutation.getFields()[name]!.args.map((a) => a.name), name).toContain('expectedVersion')
     }
     expect(mutation.getFields().confirmHeldRelease!.args.map((a) => a.name)).toContain('reviewVersion')

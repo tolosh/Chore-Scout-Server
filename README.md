@@ -18,6 +18,7 @@ The spec names Node/TypeScript, MongoDB and in-memory database tests. Where it i
 | `src/graphql/` | `POST /graphql`: the session check first, then the v1 schema's resolvers (CS-3942 onwards) |
 | `src/identity/` | Principal, session-check port and cache (bob-session/1 §6), authorisation helpers (CS-3942) |
 | `src/bob/` | BOB adapters, each written to a published BOB contract. Session check: bob-session/1, Confluence 3224666113. Family routes: bob-family/1, Confluence 3224731649 |
+| `src/chores/`, `src/unsplit/` | Jobs and Guardian approvals, job pay under the Guardian's session (CS-3949); the unsplit ledger (CS-3949 credit, CS-3953 split) |
 | `src/family-setup/` | Family set-up orchestration under the Guardian's session (CS-3948) |
 | `src/config.ts`, `src/secrets.ts` | Config from the environment or the secrets store; fails closed |
 | `src/app.ts`, `src/main.ts` | API process: `/health` (reports the git SHA), `/ready` (database ping), correlation ids |

@@ -45,6 +45,33 @@ export function parsed<S extends z.ZodTypeAny, T>(o: BobOutcome, schema: S, map:
   return { kind: 'ok', value: map(r.data), replay: o.replay }
 }
 
+// ---------------------------------------------------------------- §5 job payment
+
+const jobPayment = z.object({
+  payment_id: id,
+  status: z.literal('completed'),
+  purpose: z.literal('job'),
+  job_ref: id,
+  child_customer_id: id,
+  amount_cents: z.number().int().positive(),
+  currency: z.literal('AUD'),
+})
+
+export interface JobPaymentInput {
+  childCustomerId: string
+  jobRef: string
+  fromAccountId: string
+  amountCents: number
+  description: string
+}
+
+export interface JobPayment {
+  paymentId: string
+  jobRef: string
+  childCustomerId: string
+  amountCents: number
+}
+
 export class BobFamilyClient {
   constructor(private readonly http: BobHttp) {}
 
@@ -68,5 +95,22 @@ export class BobFamilyClient {
       guardianCustomerId: d.link.guardian_customer_id,
       accounts: { spend: d.accounts.spend.account_id, save: d.accounts.save.account_id, give: d.accounts.give.account_id },
     }))
+  }
+
+  /**
+   * §5 POST /api/v1/children/{child_id}/job-payments under the APPROVING
+   * GUARDIAN'S own session (never a service credential, §9.1). Key
+   * `cs:<opId>:job`. A 201 (or its replay) means BOB committed; the money
+   * arrives unsplit in the child's Spend.
+   */
+  async payJob(session: SessionToken, idempotencyKey: string, input: JobPaymentInput): Promise<Outcome<JobPayment>> {
+    const o = await this.http.send({
+      method: 'POST',
+      path: `/api/v1/children/${encodeURIComponent(input.childCustomerId)}/job-payments`,
+      auth: { session },
+      idempotencyKey,
+      body: { job_ref: input.jobRef, from_account_id: input.fromAccountId, amount_cents: input.amountCents, currency: 'AUD', description: input.description },
+    })
+    return parsed(o, jobPayment, (d) => ({ paymentId: d.payment_id, jobRef: d.job_ref, childCustomerId: d.child_customer_id, amountCents: d.amount_cents }))
   }
 }
