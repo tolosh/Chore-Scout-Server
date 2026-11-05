@@ -74,6 +74,42 @@ export interface JobPayment {
   amountCents: number
 }
 
+// ---------------------------------------------------------------- §6.1 child allocation
+
+export type BobJar = 'spend' | 'save' | 'give'
+
+const allocation = z.object({
+  allocation_ref: id,
+  status: z.literal('completed'),
+  legs: z.array(
+    z.object({
+      leg_id: id,
+      from_jar: z.enum(['spend', 'save', 'give']),
+      to_jar: z.enum(['spend', 'save', 'give']),
+      amount_cents: z.number().int().positive(),
+      purpose: z.literal('allocation'),
+      origin: z.literal('child'),
+    }),
+  ),
+  give_outcome: z.object({
+    status: z.enum(['donated', 'held', 'none']),
+    donation_id: id.optional(),
+    amount_cents: z.number().int().nonnegative().optional(),
+  }),
+})
+
+export interface AllocationInput {
+  allocationRef: string
+  fromJar: BobJar
+  legs: { toJar: BobJar; amountCents: number }[]
+}
+
+export interface Allocation {
+  allocationRef: string
+  legs: { legId: string; toJar: BobJar; amountCents: number }[]
+  giveOutcome: { status: 'donated' | 'held' | 'none'; donationId: string | null; amountCents: number }
+}
+
 export class BobFamilyClient {
   constructor(private readonly http: BobHttp) {}
 
@@ -114,5 +150,26 @@ export class BobFamilyClient {
       body: { job_ref: input.jobRef, from_account_id: input.fromAccountId, amount_cents: input.amountCents, currency: 'AUD', description: input.description },
     })
     return parsed(o, jobPayment, (d) => ({ paymentId: d.payment_id, jobRef: d.job_ref, childCustomerId: d.child_customer_id, fromAccountId: d.from_account_id, amountCents: d.amount_cents }))
+  }
+
+  /**
+   * §6.1 POST /api/v1/children/me/allocations under the CHILD'S own session.
+   * Jars, not account ids (`me` is the presenting child). All legs execute
+   * atomically; BOB stamps purpose `allocation` and origin `child`, and runs
+   * the Give sweep or hold (§6.2) in the same transaction. Key `cs:<splitOpId>:split`.
+   */
+  async allocate(session: SessionToken, idempotencyKey: string, input: AllocationInput): Promise<Outcome<Allocation>> {
+    const o = await this.http.send({
+      method: 'POST',
+      path: '/api/v1/children/me/allocations',
+      auth: { session },
+      idempotencyKey,
+      body: { allocation_ref: input.allocationRef, from_jar: input.fromJar, legs: input.legs.map((l) => ({ to_jar: l.toJar, amount_cents: l.amountCents })) },
+    })
+    return parsed(o, allocation, (d) => ({
+      allocationRef: d.allocation_ref,
+      legs: d.legs.map((l) => ({ legId: l.leg_id, toJar: l.to_jar, amountCents: l.amount_cents })),
+      giveOutcome: { status: d.give_outcome.status, donationId: d.give_outcome.donation_id ?? null, amountCents: d.give_outcome.amount_cents ?? 0 },
+    }))
   }
 }

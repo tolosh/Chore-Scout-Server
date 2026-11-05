@@ -360,9 +360,26 @@ input CsSplitLegInput {
   amount: CsMoneyInput!
 }
 
+enum CsGiveOutcomeStatus {
+  "The Give share went at once to the child's confirmed recipient (bob-family/1 §6.2)."
+  DONATED
+  "No eligible confirmed recipient: the Give share stays in Give, held (HOLD-1)."
+  HELD
+  "No Give share (zero Give makes no donation)."
+  NONE
+}
+
+type CsGiveOutcome {
+  status: CsGiveOutcomeStatus!
+  amount: CsMoney!
+  donationRef: ID
+}
+
 type CsSplitResult {
   unsplit: CsUnsplit!
   operations: [CsMoneyOperation!]!
+  "Set once BOB has completed the split (CS-3953)."
+  giveOutcome: CsGiveOutcome
 }
 
 # ---------------------------------------------------------------- giving (Decision 2, ID-4, D12, SD-6)
@@ -593,6 +610,11 @@ type Mutation {
   "Guardian only. Re-sends a payment whose outcome is unknown, with its original BOB key, amount and account (CS-3949)."
   retryJobPayment(jobId: ID!, expectedVersion: Int!, idempotencyKey: ID!): CsJobDecisionResult!
 
+  """
+  Child session only, for the child's own unsplit job pay (CS-3953). Each jar
+  at most once, exact cents, adding up to the whole unsplit balance at
+  expectedVersion. Runs under the child's session; BOB stamps origin child.
+  """
   splitUnsplit(childId: ID!, legs: [CsSplitLegInput!]!, expectedVersion: Int!, idempotencyKey: ID!): CsSplitResult!
 
   setCharityPreference(childId: ID!, bobCharityId: ID!, expectedVersion: Int, idempotencyKey: ID!): CsCharityPreference!
