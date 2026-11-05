@@ -215,6 +215,44 @@ export interface GiveRecipient {
   eligible: boolean
 }
 
+// ---------------------------------------------------------------- §6.4, §6.5 held Give and its release
+
+const heldGive = z.object({ child_customer_id: id, held_cents: z.number().int().nonnegative(), currency: z.literal('AUD') })
+const releaseQuote = z.object({
+  quote_id: id,
+  amount_cents: z.number().int().positive(),
+  currency: z.literal('AUD'),
+  recipient: z.object({ charity_id: id, name: z.string().min(1).max(200), revision: z.number().int().nonnegative() }),
+  expires_at: z.string().min(1),
+})
+const release = z.object({
+  donation_id: id,
+  status: z.literal('completed'),
+  purpose: z.literal('donation_release'),
+  amount_cents: z.number().int().positive(),
+  recipient: z.object({ charity_id: id, revision: z.number().int().nonnegative() }),
+})
+
+export interface HeldGive {
+  childCustomerId: string
+  heldCents: number
+}
+export interface ReleaseQuote {
+  quoteId: string
+  amountCents: number
+  charityId: string
+  name: string
+  revision: number
+  expiresAt: Date
+}
+export interface Release {
+  donationId: string
+  amountCents: number
+  charityId: string
+  revision: number
+}
+export const releaseKey = (quoteId: string) => `cs:${quoteId}:release`
+
 export class BobGivingClient {
   constructor(private readonly http: BobHttp) {}
 
@@ -229,5 +267,35 @@ export class BobGivingClient {
     // A recipient other than the one asked for is outside the contract: unknown, fail closed.
     if (out.kind === 'ok' && (out.value.charityId !== charityId || Number.isNaN(out.value.confirmedAt.getTime()))) return { kind: 'unknown', detail: 'response outside bob-family/1' }
     return out
+  }
+
+  /** §6.4 GET held Give: the child themselves (`me`) or a Guardian with an active link. Read only. */
+  async heldGive(session: SessionToken, child: string): Promise<Outcome<HeldGive>> {
+    const o = await this.http.send({ method: 'GET', path: `/api/v1/children/${encodeURIComponent(child)}/give/held`, auth: { session } })
+    return parsed(o, heldGive, (d) => ({ childCustomerId: d.child_customer_id, heldCents: d.held_cents }))
+  }
+
+  /** §6.5 quote under the child's own session: all money held now, to this charity, for 5 minutes. Moves no money. */
+  async releaseQuote(session: SessionToken, charityId: string): Promise<Outcome<ReleaseQuote>> {
+    const o = await this.http.send({ method: 'POST', path: '/api/v1/children/me/give/release-quotes', auth: { session }, body: { charity_id: charityId } })
+    const out = parsed(o, releaseQuote, (d) => ({ quoteId: d.quote_id, amountCents: d.amount_cents, charityId: d.recipient.charity_id, name: d.recipient.name, revision: d.recipient.revision, expiresAt: new Date(d.expires_at) }))
+    if (out.kind === 'ok' && (out.value.charityId !== charityId || Number.isNaN(out.value.expiresAt.getTime()))) return { kind: 'unknown', detail: 'response outside bob-family/1' }
+    return out
+  }
+
+  /**
+   * §6.5 confirm under the child's own session, key `cs:<quoteId>:release`. The
+   * body echoes what the child saw; BOB refuses with FRESH_QUOTE_NEEDED if
+   * anything changed (HOLD-4), and pays at most once per quote whatever the key.
+   */
+  async confirmRelease(session: SessionToken, quoteId: string, seen: { amountCents: number; charityId: string; revision: number }): Promise<Outcome<Release>> {
+    const o = await this.http.send({
+      method: 'POST',
+      path: `/api/v1/children/me/give/release-quotes/${encodeURIComponent(quoteId)}/confirm`,
+      auth: { session },
+      idempotencyKey: releaseKey(quoteId),
+      body: { amount_cents: seen.amountCents, charity_id: seen.charityId, revision: seen.revision },
+    })
+    return parsed(o, release, (d) => ({ donationId: d.donation_id, amountCents: d.amount_cents, charityId: d.recipient.charity_id, revision: d.recipient.revision }))
   }
 }
