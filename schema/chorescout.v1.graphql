@@ -62,9 +62,23 @@ enum CsJar {
 # ---------------------------------------------------------------- viewer
 
 enum CsRole {
+  "BOB roles include guardian: at least one non-revoked link to a child."
   GUARDIAN
   CHILD
   TELLER
+  "An adult BOB customer with no linked children yet (e.g. before family set-up). CS-3942."
+  CUSTOMER
+}
+
+"BOB's status for a Guardian's link to a child: PENDING until the child's first sign-in."
+enum CsLinkStatus {
+  PENDING
+  ACTIVE
+}
+
+type CsLinkedChild {
+  customerId: ID!
+  status: CsLinkStatus!
 }
 
 "Age band worked out by BOB from the date of birth (ID-9)."
@@ -85,6 +99,8 @@ type CsViewer {
   ageBand: CsAgeBand
   linkedChildIds: [ID!]!
   linkedGuardianIds: [ID!]!
+  "Guardian sessions: BOB's linked children with link status (CS-3942)."
+  linkedChildren: [CsLinkedChild!]!
   anonymousPlayerId: ID
 }
 

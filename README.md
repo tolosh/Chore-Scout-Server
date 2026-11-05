@@ -15,6 +15,9 @@ The spec names Node/TypeScript, MongoDB and in-memory database tests. Where it i
 | --- | --- |
 | `schema/chorescout.v1.graphql` | The versioned GraphQL contract, exposed through the DSL (CS-3935) |
 | `scripts/schema-compat.ts` | CI check: no breaking change to a published `vN` without a new `vN+1` file |
+| `src/graphql/` | `POST /graphql`: the session check first, then the v1 schema's resolvers (CS-3942 onwards) |
+| `src/identity/` | Principal, session-check port and cache (bob-session/1 §6), authorisation helpers (CS-3942) |
+| `src/bob/` | BOB adapters, each written to a published BOB contract. Session check: bob-session/1, Confluence 3224666113 |
 | `src/config.ts`, `src/secrets.ts` | Config from the environment or the secrets store; fails closed |
 | `src/app.ts`, `src/main.ts` | API process: `/health` (reports the git SHA), `/ready` (database ping), correlation ids |
 | `src/healthcheck.ts` | Container health check: `/ready` via Node's fetch (CS-3992) |
@@ -44,7 +47,18 @@ GIT_SHA=$(git rev-parse HEAD) MONGODB_URI=mongodb://localhost:27017 MONGODB_DB=c
 - Secrets have no defaults in code. Without `GIT_SHA`, `MONGODB_URI` or `MONGODB_DB` every process exits with code 78.
 - Set `CS_SECRETS_ID` to read a JSON secret from AWS Secrets Manager. A key set in both the environment and the secret is refused.
 - The server holds no BOB teller credential and no blanket BOB credential. Any `*TELLER*` key, or any `BOB_*` key other than `BOB_ALLOWANCE_CREDENTIAL`, refuses start-up. `BOB_ALLOWANCE_CREDENTIAL` is required by the jobs process and refused by the API process.
+- `BOB_API_URL` is the one non-credential `BOB_*` key. It is refused if it carries userinfo, a query or a fragment. Without it the API starts, but every GraphQL request gets 503 `UPSTREAM_UNAVAILABLE`.
 - See `.env.example` for every key.
+
+## Sessions (CS-3942)
+
+The DSL forwards each person's BOB access token unchanged as `Authorization: Bearer <token>` on `POST /graphql`. Before parsing or executing anything, the server asks BOB `GET /api/v1/auth/session` with that same token (contract `bob-session/1`, Confluence 3224666113):
+
+- no or malformed header, BOB 401 or 429: HTTP 401 `UNAUTHENTICATED`;
+- BOB 5xx, a timeout, or an answer outside the contract: HTTP 503 `UPSTREAM_UNAVAILABLE` (fail closed, no fallback);
+- otherwise the operation runs as that person.
+
+A successful answer is cached in process memory only, keyed by the token's SHA-256, for at most 30 seconds from BOB's `checked_at` (and of our own clock), and never past the token's `access_expires_at`. Failures are never cached, and a 401 from any BOB route drops the entry. Family scope is BOB's `children` list (Guardian) or the child's own id, never the `families` table or a client-supplied id. The token is never logged; log lines carry BOB's `session_id` and `customer_id`. Introspection is refused in production.
 
 ## Images and deploys
 
