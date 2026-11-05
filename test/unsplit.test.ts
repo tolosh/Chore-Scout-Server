@@ -34,8 +34,7 @@ beforeEach(async () => {
   bob = new FakeBob()
   bob.clock = () => new Date(t)
   ;({ funding } = seedFamily(bob))
-  bob.addAdult('cust_T_CHARITY_PAWS')
-  charity = bob.openAccount('cust_T_CHARITY_PAWS', 'spend')
+  charity = bob.addCharity('cust_T_CHARITY_PAWS', 'Paws Rescue')
 })
 
 const CREATE = `mutation($c: ID!, $r: CsMoneyInput, $key: ID!) { createJob(childId: $c, kind: EXTRA_EARNER, title: "Washed the car", reward: $r, idempotencyKey: $key) { jobId version } }`
@@ -84,7 +83,7 @@ describe('T1: $2.00 split 1.00/0.60/0.40 gives exact legs and unsplit goes to 0'
     const api = buildTestApi({ db, bob, now: () => t })
     const sarah = bob.signIn(SARAH)
     const mia = bob.signIn(MIA)
-    bob.recipients.set(MIA, charity)
+    bob.recipients.set(MIA, { charityId: charity, revision: 1 })
     await payJob(api, sarah, mia)
     const before = await unsplitOf(api, mia)
     expect(before.balance.amount).toBe('2.00')
@@ -99,7 +98,7 @@ describe('T1: $2.00 split 1.00/0.60/0.40 gives exact legs and unsplit goes to 0'
     expect(bob.balance(MIA, 'spend')).toBe(100)
     expect(bob.balance(MIA, 'save')).toBe(60)
     expect(bob.balance(MIA, 'give')).toBe(0)
-    expect(bob.accounts.get(charity)!.balance).toBe(40)
+    expect(bob.balance(charity, 'spend')).toBe(40)
     await api.app.close()
   })
 
@@ -251,7 +250,7 @@ describe('T6: with no charity selected, the Give share is held (HOLD-1)', () => 
   it('a zero Give creates no Give leg and no donation', async () => {
     const api = buildTestApi({ db, bob, now: () => t })
     const mia = bob.signIn(MIA)
-    bob.recipients.set(MIA, charity)
+    bob.recipients.set(MIA, { charityId: charity, revision: 1 })
     await payJob(api, bob.signIn(SARAH), mia)
     const v = (await unsplitOf(api, mia)).version
     const out = (await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '1.00', '0.00'), v, key: K('split-zero-001') })).body.data!.splitUnsplit as SplitOut
@@ -408,7 +407,7 @@ describe('review optional 1 and 2: the Give outcome must match the Give share; t
   it('a donated Give keeps BOB’s recipient and revision on the operation', async () => {
     const api = buildTestApi({ db, bob, now: () => t })
     const mia = bob.signIn(MIA)
-    bob.recipients.set(MIA, charity)
+    bob.recipients.set(MIA, { charityId: charity, revision: 1 })
     await payJob(api, bob.signIn(SARAH), mia)
     const v = (await unsplitOf(api, mia)).version
     await api.gql(mia, SPLIT, { c: MIA, legs: legs('1.00', '0.60', '0.40'), v, key: K('split-o2-a') })
@@ -431,7 +430,7 @@ describe('D52: Save→Give is a child allocation choice, through §6.1 so the D5
 
   it('Save→Give with a confirmed recipient donates exactly that credit under the child’s session', async () => {
     const api = buildTestApi({ db, bob, now: () => t })
-    bob.recipients.set(MIA, charity)
+    bob.recipients.set(MIA, { charityId: charity, revision: 1 })
     fund(100)
     const out = await api.ports.family.allocate(new SessionToken(bob.signIn(MIA)), K('cs:d52-a:split'), { allocationRef: 'spl_d52a', fromJar: 'save', legs: [{ toJar: 'give', amountCents: 40 }] })
     expect(out.kind).toBe('ok')

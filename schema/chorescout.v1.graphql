@@ -384,11 +384,29 @@ type CsSplitResult {
 
 # ---------------------------------------------------------------- giving (Decision 2, ID-4, D12, SD-6)
 
+"""
+Whether the child's future Give credits go straight to their charity (D51):
+only to a charity the child chose and BOB recorded as confirmed and eligible.
+Otherwise BOB holds them.
+"""
+enum CsCharityAvailability {
+  "The child hasn't chosen a charity yet: Give credits are held."
+  NONE_SELECTED
+  "The chosen charity isn't eligible now (disabled or unresolved): Give credits are held, with no silent replacement."
+  UNAVAILABLE
+  "BOB has the child's confirmed, eligible charity: Give credits are donated at once."
+  AVAILABLE
+}
+
 type CsCharityPreference {
   childCustomerId: ID!
   "The BOB charity id only; routing comes from Odyssey via BOB (SD-6)."
   bobCharityId: ID!
   version: Int!
+  "BOB's revision of the charity when the child confirmed it (bob-family/1 §6.3)."
+  revision: Int
+  confirmedAt: CsDateTime
+  availability: CsCharityAvailability!
 }
 
 type CsHeldGiveReview {
@@ -409,6 +427,8 @@ type CsDonation {
 }
 
 type CsGiving {
+  "NONE_SELECTED when preference is null."
+  availability: CsCharityAvailability!
   preference: CsCharityPreference
   heldGiving: CsHeldGiveReview
   donations: [CsDonation!]!
@@ -617,6 +637,13 @@ type Mutation {
   """
   splitUnsplit(childId: ID!, legs: [CsSplitLegInput!]!, expectedVersion: Int!, idempotencyKey: ID!): CsSplitResult!
 
+  """
+  Child session only (CS-3962, D51). Records the child's own choice and confirms
+  it in BOB under the child's session (bob-family/1 §6.3). Moves no money and
+  never releases held Give (HOLD-2). expectedVersion is required once a
+  preference exists. A charity that isn't eligible gives CHARITY_UNAVAILABLE,
+  and the earlier choice stays.
+  """
   setCharityPreference(childId: ID!, bobCharityId: ID!, expectedVersion: Int, idempotencyKey: ID!): CsCharityPreference!
 
   confirmHeldRelease(childId: ID!, reviewVersion: Int!, idempotencyKey: ID!): CsHeldReleaseResult!

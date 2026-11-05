@@ -198,3 +198,36 @@ export class BobFamilyClient {
     }))
   }
 }
+
+// ---------------------------------------------------------------- §6.3 the child's Give recipient
+
+const giveRecipient = z.object({
+  charity_id: id,
+  revision: z.number().int().nonnegative(),
+  confirmed_at: z.string().min(1),
+  eligible: z.boolean(),
+})
+
+export interface GiveRecipient {
+  charityId: string
+  revision: number
+  confirmedAt: Date
+  eligible: boolean
+}
+
+export class BobGivingClient {
+  constructor(private readonly http: BobHttp) {}
+
+  /**
+   * §6.3 PUT /api/v1/children/me/give-recipient under the CHILD'S own session.
+   * The child's own confirmation of where future Give credits go (D51). Naturally
+   * idempotent; no key. Moves no money and never releases held Give (HOLD-2).
+   */
+  async setGiveRecipient(session: SessionToken, charityId: string): Promise<Outcome<GiveRecipient>> {
+    const o = await this.http.send({ method: 'PUT', path: '/api/v1/children/me/give-recipient', auth: { session }, body: { charity_id: charityId } })
+    const out = parsed(o, giveRecipient, (d) => ({ charityId: d.charity_id, revision: d.revision, confirmedAt: new Date(d.confirmed_at), eligible: d.eligible }))
+    // A recipient other than the one asked for is outside the contract: unknown, fail closed.
+    if (out.kind === 'ok' && (out.value.charityId !== charityId || Number.isNaN(out.value.confirmedAt.getTime()))) return { kind: 'unknown', detail: 'response outside bob-family/1' }
+    return out
+  }
+}
