@@ -79,6 +79,10 @@ export class FakeBob {
   /** Every completed money movement BOB made (its ledger), for evidence in tests. */
   readonly ledger: { paymentId: string; purpose: string; origin?: string; from: string; to: string; amountCents: number; ref: string }[] = []
   readonly jobPayments = new Map<string, string>()
+  /** §6.3 confirmed Give recipient per child: the charity's account id (set directly in tests). */
+  readonly recipients = new Map<string, string>()
+  /** §6.2 Give credits held as give_unresolved, per child. */
+  readonly held = new Map<string, number>()
   readonly accounts = new Map<string, { owner: string; jar: 'spend' | 'save' | 'give' | 'funding'; balance: number }>()
 
   readonly people = new Map<string, Person>()
@@ -297,8 +301,55 @@ export function move(bob: FakeBob, from: string, to: string, amountCents: number
   return paymentId
 }
 
-/** bob-family/1 §4.1 and §5. Later tickets' routes are installed alongside. */
+/** §6.2: a Give credit is donated at once to the confirmed recipient, or held. */
+export function sweep(
+  bob: FakeBob,
+  childId: string,
+  amountCents: number,
+  ref: string,
+): { status: 'donated' | 'held'; donation_id?: string; amount_cents: number; recipient?: { charity_id: string; revision: number } } {
+  const to = bob.recipients.get(childId)
+  if (to) {
+    const donation = move(bob, bob.accountOf(childId, 'give')!, to, amountCents, 'donation', ref)
+    return { status: 'donated', donation_id: donation.replace('pay_', 'don_'), amount_cents: amountCents, recipient: { charity_id: to, revision: 1 } }
+  }
+  bob.held.set(childId, (bob.held.get(childId) ?? 0) + amountCents)
+  bob.ledger.push({ paymentId: newId('pay'), purpose: 'give_unresolved', from: bob.accountOf(childId, 'give')!, to: bob.accountOf(childId, 'give')!, amountCents, ref })
+  return { status: 'held', amount_cents: amountCents }
+}
+
+/** bob-family/1 §4.1, §5 and §6.1. Later tickets' routes are installed alongside. */
 export function installFamilyRoutes(bob: FakeBob): void {
+  bob.route('POST', /^\/api\/v1\/children\/me\/allocations$/, true, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    if (c.person.kind !== 'child') return err(403, 'FORBIDDEN')
+    const childId = c.person.customerId
+    const b = c.body as { allocation_ref?: unknown; from_jar?: unknown; legs?: { to_jar?: unknown; amount_cents?: unknown }[] }
+    const jars = ['spend', 'save', 'give']
+    if (typeof b.allocation_ref !== 'string' || !jars.includes(String(b.from_jar)) || !Array.isArray(b.legs) || b.legs.length === 0) return err(400, 'VALIDATION_ERROR')
+    if (b.from_jar === 'give') return err(403, 'CHILD_LIMIT', { reason: 'no_withdrawal_from_give' })
+    const to = b.legs.map((l) => String(l.to_jar))
+    if (new Set(to).size !== to.length || to.some((j) => !jars.includes(j) || j === b.from_jar)) return err(400, 'VALIDATION_ERROR')
+    if (b.legs.some((l) => !Number.isInteger(l.amount_cents) || (l.amount_cents as number) <= 0)) return err(400, 'VALIDATION_ERROR')
+    // §6.1 as amended by D52: Save→Give is allowed; a Give leg from either jar runs the §6.2 sweep.
+    const allowed = (f: string, t: string) => (f === 'spend' && (t === 'save' || t === 'give')) || (f === 'save' && (t === 'spend' || t === 'give'))
+    if (to.some((t) => !allowed(String(b.from_jar), t))) return err(400, 'VALIDATION_ERROR')
+    const fromAcct = bob.accountOf(childId, b.from_jar as 'spend')!
+    const total = b.legs.reduce((n, l) => n + (l.amount_cents as number), 0)
+    if (bob.accounts.get(fromAcct)!.balance < total) return err(422, 'INSUFFICIENT_FUNDS')
+    const legs = b.legs.map((l) => ({
+      leg_id: move(bob, fromAcct, bob.accountOf(childId, l.to_jar as 'save')!, l.amount_cents as number, 'allocation', b.allocation_ref as string, 'child'),
+      from_jar: b.from_jar,
+      to_jar: l.to_jar,
+      amount_cents: l.amount_cents,
+      purpose: 'allocation',
+      origin: 'child',
+    }))
+    const giveLeg = b.legs.find((l) => l.to_jar === 'give')
+    const give_outcome = giveLeg ? sweep(bob, childId, giveLeg.amount_cents as number, b.allocation_ref) : { status: 'none' }
+    return ok(201, { allocation_ref: b.allocation_ref, status: 'completed', legs, give_outcome, completed_at: bob.clock().toISOString() })
+  })
+
   bob.route('POST', /^\/api\/v1\/children\/([^/]+)\/job-payments$/, true, (c) => {
     if (!c.person) return err(401, 'UNAUTHORIZED')
     const childId = decodeURIComponent(c.params[0]!)
