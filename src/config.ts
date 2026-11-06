@@ -10,7 +10,12 @@
  *   credential (identity model §6, §11.10; spec §9). The only BOB credential slot
  *   is BOB_ALLOWANCE_CREDENTIAL, used by the job process for the scheduled
  *   allowance job (CS-3979, spec §3.7). Any other BOB_* or *TELLER* key present
- *   in the environment or secrets refuses start-up.
+ *   in the environment or secrets refuses start-up, except BOB_API_URL, which
+ *   is an address, not a credential, and is refused if it carries one
+ *   (userinfo, a query string or a fragment).
+ * - The server reaches BOB only with the person's own forwarded session
+ *   (CS-3942; contract bob-session/1 §3). Without BOB_API_URL the API still
+ *   starts, but every request is refused (UPSTREAM_UNAVAILABLE).
  */
 import { z } from 'zod'
 
@@ -28,6 +33,20 @@ export const SECRET_KEYS = ['MONGODB_URI', 'BOB_ALLOWANCE_CREDENTIAL'] as const
 
 /** The single permitted BOB credential slot (scoped standing-authority credential). */
 export const ALLOWED_BOB_KEYS = new Set<string>(['BOB_ALLOWANCE_CREDENTIAL'])
+
+/** BOB keys that are not credentials. Each is validated so it cannot carry one. */
+export const NON_CREDENTIAL_BOB_KEYS = new Set<string>(['BOB_API_URL'])
+
+/** An http(s) origin plus optional path, with no userinfo, query or fragment. */
+export function credentialFreeUrl(v: string): boolean {
+  let u: URL
+  try {
+    u = new URL(v)
+  } catch {
+    return false
+  }
+  return (u.protocol === 'https:' || u.protocol === 'http:') && u.username === '' && u.password === '' && u.search === '' && u.hash === '' && !v.includes('@')
+}
 
 const intFrom = (name: string, def: number, min: number, max: number) =>
   z
@@ -69,6 +88,15 @@ const base = z.object({
   MONGO_SERVER_SELECTION_TIMEOUT_MS: intFrom('MONGO_SERVER_SELECTION_TIMEOUT_MS', 5_000, 1, 120_000),
   MONGO_CONNECT_TIMEOUT_MS: intFrom('MONGO_CONNECT_TIMEOUT_MS', 5_000, 1, 120_000),
   MONGO_SOCKET_TIMEOUT_MS: intFrom('MONGO_SOCKET_TIMEOUT_MS', 30_000, 0, 600_000),
+
+  // BOB API base URL (CS-3942). Optional: without it every request is refused.
+  BOB_API_URL: z
+    .string()
+    .refine(credentialFreeUrl, 'BOB_API_URL must be an http(s) URL with no credentials, query or fragment')
+    .optional(),
+  // Session check (contract bob-session/1 §6): cache at most 30 s; 0 disables the cache.
+  SESSION_CHECK_TIMEOUT_MS: intFrom('SESSION_CHECK_TIMEOUT_MS', 2_000, 100, 30_000),
+  SESSION_CACHE_TTL_MS: intFrom('SESSION_CACHE_TTL_MS', 30_000, 0, 30_000),
 })
 
 const jobsExtra = z.object({
@@ -87,7 +115,7 @@ export type Config<R extends Role = Role> = R extends 'jobs' ? JobsConfig : Base
 export function forbiddenCredentialKeys(env: Record<string, string | undefined>): string[] {
   return Object.keys(env)
     .filter((k) => env[k] !== undefined && env[k] !== '')
-    .filter((k) => /TELLER/i.test(k) || (/^BOB_/i.test(k) && !ALLOWED_BOB_KEYS.has(k)))
+    .filter((k) => /TELLER/i.test(k) || (/^BOB_/i.test(k) && !ALLOWED_BOB_KEYS.has(k) && !NON_CREDENTIAL_BOB_KEYS.has(k)))
     .sort()
 }
 

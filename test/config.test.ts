@@ -65,8 +65,29 @@ describe('config: no BOB teller or blanket credential (T5, code side)', () => {
     expect(problemsOf(() => loadConfig('api', { ...baseEnv(), BOB_ALLOWANCE_CREDENTIAL: 'x'.repeat(32) })).join()).toMatch(/only permitted in the jobs process/)
   })
 
-  it('only BOB_ALLOWANCE_CREDENTIAL is an allowed BOB key', () => {
-    expect(forbiddenCredentialKeys({ BOB_ALLOWANCE_CREDENTIAL: 'x', BOB_X: 'y', PATH: '/bin' })).toEqual(['BOB_X'])
+  it('only BOB_ALLOWANCE_CREDENTIAL is an allowed BOB credential key; BOB_API_URL is the one non-credential key', () => {
+    expect(forbiddenCredentialKeys({ BOB_ALLOWANCE_CREDENTIAL: 'x', BOB_API_URL: 'http://bob', BOB_X: 'y', bob_api_url: 'z', PATH: '/bin' })).toEqual(['BOB_X', 'bob_api_url'])
+  })
+})
+
+describe('config: BOB_API_URL (CS-3942)', () => {
+  it('is optional, and accepted as a plain http(s) URL', () => {
+    expect(loadConfig('api', baseEnv()).BOB_API_URL).toBeUndefined()
+    expect(loadConfig('api', { ...baseEnv(), BOB_API_URL: 'https://bob.internal:8443/base' }).BOB_API_URL).toBe('https://bob.internal:8443/base')
+  })
+
+  it.each(['https://user:pass@bob.internal', 'https://tok@bob.internal', 'https://bob.internal/?key=abc', 'https://bob.internal/#k', 'ftp://bob.internal', 'not a url'])(
+    'refuses %s without echoing the value',
+    (v) => {
+      const p = problemsOf(() => loadConfig('api', { ...baseEnv(), BOB_API_URL: v })).join()
+      expect(p).toMatch(/BOB_API_URL must be an http\(s\) URL with no credentials/)
+      expect(p).not.toContain(v)
+    },
+  )
+
+  it('session cache TTL is capped at 30 s (bob-session/1 §6)', () => {
+    expect(loadConfig('api', baseEnv()).SESSION_CACHE_TTL_MS).toBe(30_000)
+    expect(problemsOf(() => loadConfig('api', { ...baseEnv(), SESSION_CACHE_TTL_MS: '30001' })).join()).toMatch(/SESSION_CACHE_TTL_MS/)
   })
 })
 

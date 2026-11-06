@@ -5,12 +5,13 @@
  * otherwise one is generated. It is the Fastify request id, so every request
  * log line carries it as "correlationId", and it is echoed on the response.
  *
- * Feature routes and the GraphQL resolvers for schema/chorescout.v1.graphql
- * arrive with CS-3942 onwards; the session check via BOB is CS-3942.
+ * POST /graphql (CS-3942) is registered when `graphql` deps are given: every
+ * request's forwarded session is checked with BOB first (src/graphql/route.ts).
  */
 import { randomUUID } from 'node:crypto'
 import Fastify, { LogController, type FastifyInstance } from 'fastify'
 import type { Db } from 'mongodb'
+import { registerGraphql, type GraphqlRouteDeps } from './graphql/route.js'
 import { CORRELATION_HEADER, loggerOptions } from './logger.js'
 
 const CORRELATION_RE = /^[A-Za-z0-9._:-]{1,128}$/
@@ -23,6 +24,8 @@ export interface AppDeps {
   pingTimeoutMs?: number
   /** Log destination override (tests). Defaults to stdout. */
   logStream?: NodeJS.WritableStream
+  /** The GraphQL API (CS-3942). Omitted, only /health and /ready are served. */
+  graphql?: GraphqlRouteDeps
 }
 
 export function buildApp(deps: AppDeps): FastifyInstance {
@@ -59,6 +62,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       return reply.code(503).send({ status: 'unavailable', sha: deps.gitSha, db: 'down' })
     }
   })
+
+  if (deps.graphql) registerGraphql(app, deps.graphql)
 
   return app
 }
