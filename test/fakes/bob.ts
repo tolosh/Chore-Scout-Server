@@ -76,6 +76,9 @@ export class FakeBob {
   /** Force a status for the next N matching requests WITHOUT processing them (e.g. 503). */
   failBefore: { re: RegExp; count: number; status: number; code: string } | null = null
   readonly emails = new Map<string, Set<string>>()
+  /** Every completed money movement BOB made (its ledger), for evidence in tests. */
+  readonly ledger: { paymentId: string; purpose: string; origin?: string; from: string; to: string; amountCents: number; ref: string }[] = []
+  readonly jobPayments = new Map<string, string>()
   readonly accounts = new Map<string, { owner: string; jar: 'spend' | 'save' | 'give' | 'funding'; balance: number }>()
 
   readonly people = new Map<string, Person>()
@@ -88,6 +91,8 @@ export class FakeBob {
   clock: () => Date = () => new Date()
   /** Mutates a 200 body before it is sent (contract-violation tests). */
   mutate: ((data: Record<string, unknown>) => void) | null = null
+  /** Mutates a 2xx bob-family/1 response's data as sent (contract-violation tests). BOB's own state is unchanged. */
+  mutateFamily: ((data: Record<string, unknown>) => void) | null = null
 
   addAdult(customerId: string, bank: Bank = 'bank_bilgola'): this {
     this.people.set(customerId, { customerId, bank, kind: 'adult' })
@@ -237,7 +242,12 @@ export class FakeBob {
       throw new TypeError('fetch failed (response lost after BOB committed)')
     }
     const status = replay && result.status === 201 ? 200 : result.status
-    const res = json(status, result.body)
+    let sent = result.body
+    if (this.mutateFamily && status >= 200 && status < 300) {
+      sent = structuredClone(result.body) as { data: Record<string, unknown> }
+      this.mutateFamily((sent as { data: Record<string, unknown> }).data)
+    }
+    const res = json(status, sent)
     if (replay) res.headers.set('x-idempotency-replay', 'true')
     return res
   }
@@ -275,8 +285,50 @@ function ageOn(dob: string, today: Date): number {
   return age
 }
 
-/** bob-family/1 §4.1. Later tickets' routes are installed alongside. */
+/** Move money between two accounts, as BOB's protected transfer would (one step, balance checked). */
+export function move(bob: FakeBob, from: string, to: string, amountCents: number, purpose: string, ref: string, origin?: string): string {
+  const a = bob.accounts.get(from)!
+  const b = bob.accounts.get(to)!
+  if (a.balance < amountCents) throw new Error('insufficient')
+  a.balance -= amountCents
+  b.balance += amountCents
+  const paymentId = newId('pay')
+  bob.ledger.push({ paymentId, purpose, origin, from, to, amountCents, ref })
+  return paymentId
+}
+
+/** bob-family/1 §4.1 and §5. Later tickets' routes are installed alongside. */
 export function installFamilyRoutes(bob: FakeBob): void {
+  bob.route('POST', /^\/api\/v1\/children\/([^/]+)\/job-payments$/, true, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    const childId = decodeURIComponent(c.params[0]!)
+    const child = bob.people.get(childId)
+    if (c.person.kind !== 'adult' || !child || child.bank !== c.person.bank || !bob.activeLink(c.person.customerId, childId)) return err(403, 'FORBIDDEN')
+    const b = c.body
+    const from = bob.accounts.get(String(b.from_account_id))
+    if (!from || from.owner !== c.person.customerId) return err(403, 'FORBIDDEN')
+    if (!Number.isInteger(b.amount_cents) || (b.amount_cents as number) <= 0 || b.currency !== 'AUD' || typeof b.job_ref !== 'string') return err(400, 'VALIDATION_ERROR')
+    const prior = bob.jobPayments.get(`${childId}|${b.job_ref}`)
+    if (prior) return err(409, 'JOB_ALREADY_PAID', { payment_id: prior })
+    const amount = b.amount_cents as number
+    if (from.balance < amount) return err(422, 'INSUFFICIENT_FUNDS')
+    const spend = bob.accountOf(childId, 'spend')!
+    const paymentId = move(bob, String(b.from_account_id), spend, amount, 'job', String(b.job_ref))
+    bob.jobPayments.set(`${childId}|${b.job_ref}`, paymentId)
+    return ok(201, {
+      payment_id: paymentId,
+      status: 'completed',
+      purpose: 'job',
+      job_ref: b.job_ref,
+      child_customer_id: childId,
+      from_account_id: b.from_account_id,
+      to_account_id: spend,
+      amount_cents: amount,
+      currency: 'AUD',
+      completed_at: bob.clock().toISOString(),
+    })
+  })
+
   bob.route('POST', /^\/api\/v1\/children$/, true, (c) => {
     if (!c.person) return err(401, 'UNAUTHORIZED')
     if (c.person.kind !== 'adult') return err(403, 'FORBIDDEN')
