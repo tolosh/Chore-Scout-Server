@@ -136,15 +136,18 @@ type CsSetupSlot {
   slot: Int!
   state: CsSetupSlotState!
   childCustomerId: ID
-  "Per-slot reason when REFUSED, e.g. email already used in this bank (ID-12)."
+  "BOB's code when REFUSED (EMAIL_IN_USE, AGE_OUT_OF_RANGE, VALIDATION_ERROR; final for this setupRef). While PENDING: UPSTREAM_UNAVAILABLE, or IDEMPOTENCY_CONFLICT when a retry changed this child's details (resend the original details)."
   reason: String
 }
 
 type CsFamilySetup {
   setupRef: ID!
+  "PARTIAL with resumable true: retry with the same setupRef. COMPLETE, or PARTIAL with resumable false: settled (CS-3948)."
   state: CsFamilySetupState!
   slots: [CsSetupSlot!]!
   familyId: ID
+  "True while any slot is PENDING (not tried, or BOB's outcome unknown). Only Sarah's retry resumes it; there is no background completion."
+  resumable: Boolean!
 }
 
 "Passed to BOB's create-linked-child under the Guardian's session. The server does not store contact details."
@@ -245,11 +248,26 @@ enum CsJobKind {
   NEIGHBOURHOOD
 }
 
+"""
+Job states (CS-3949): TODO -> WAITING -> SENT_BACK (resubmittable) or, on
+approval, APPROVED_PAYMENT_PENDING -> PAID or PAYMENT_FAILED for a job with a
+reward, or DONE for a good deed or a chore with no reward (no BOB call).
+"""
 enum CsJobStatus {
-  OPEN
-  SUBMITTED
-  APPROVED
-  REJECTED
+  OPEN @deprecated(reason: "Never returned. Use TODO (CS-3949).")
+  SUBMITTED @deprecated(reason: "Never returned. Use WAITING (CS-3949).")
+  APPROVED @deprecated(reason: "Never returned. Use APPROVED_PAYMENT_PENDING, PAID or DONE (CS-3949).")
+  REJECTED @deprecated(reason: "Never returned. Use SENT_BACK (CS-3949).")
+  TODO
+  WAITING
+  SENT_BACK
+  "Approved; BOB job pay recorded but not yet reported complete. PAID only after BOB completes."
+  APPROVED_PAYMENT_PENDING
+  PAID
+  "BOB refused the payment (reason on payment). No money moved."
+  PAYMENT_FAILED
+  "Approved with nothing to pay (good deed: points only; chore with no reward)."
+  DONE
 }
 
 type CsJob {
@@ -262,6 +280,11 @@ type CsJob {
   "Reference to the child's evidence photo, if any."
   evidenceRef: String
   version: Int!
+  "Good deeds carry points only (CS-3949)."
+  points: Int
+  createdAt: CsDateTime
+  "The job's one BOB payment, once approved (CS-3949)."
+  payment: CsMoneyOperation
 }
 
 enum CsApprovalKind {
@@ -303,6 +326,9 @@ type CsMoneyOperation {
   kind: String!
   status: CsMoneyOperationStatus!
   bobOperationRef: ID
+  amount: CsMoney
+  "BOB's code when FAILED (e.g. INSUFFICIENT_FUNDS, FORBIDDEN), or why it is still PENDING (e.g. UPSTREAM_UNAVAILABLE)."
+  reason: String
 }
 
 type CsJobDecisionResult {
@@ -334,9 +360,26 @@ input CsSplitLegInput {
   amount: CsMoneyInput!
 }
 
+enum CsGiveOutcomeStatus {
+  "The Give share went at once to the child's confirmed recipient (bob-family/1 §6.2)."
+  DONATED
+  "No eligible confirmed recipient: the Give share stays in Give, held (HOLD-1)."
+  HELD
+  "No Give share (zero Give makes no donation)."
+  NONE
+}
+
+type CsGiveOutcome {
+  status: CsGiveOutcomeStatus!
+  amount: CsMoney!
+  donationRef: ID
+}
+
 type CsSplitResult {
   unsplit: CsUnsplit!
   operations: [CsMoneyOperation!]!
+  "Set once BOB has completed the split (CS-3953)."
+  giveOutcome: CsGiveOutcome
 }
 
 # ---------------------------------------------------------------- giving (Decision 2, ID-4, D12, SD-6)
@@ -552,10 +595,26 @@ type Mutation {
     idempotencyKey: ID!
   ): CsAllowanceRule!
 
+  "Guardian only, for a linked child (CS-3949). A good deed carries points only; other kinds carry a reward (a HOME_JOB chore may have none)."
+  createJob(childId: ID!, kind: CsJobKind!, title: String!, reward: CsMoneyInput, points: Int, idempotencyKey: ID!): CsJob!
+
   submitJob(jobId: ID!, evidenceRef: String, expectedVersion: Int!, idempotencyKey: ID!): CsJob!
 
-  decideJob(jobId: ID!, decision: CsDecision!, expectedVersion: Int!, idempotencyKey: ID!): CsJobDecisionResult!
+  """
+  Guardian only. APPROVE on a job with a reward needs fromAccountId, the
+  Guardian's own BOB account; BOB checks it is hers (bob-family/1 §5). Job pay
+  runs under the Guardian's session and arrives unsplit.
+  """
+  decideJob(jobId: ID!, decision: CsDecision!, expectedVersion: Int!, idempotencyKey: ID!, fromAccountId: ID): CsJobDecisionResult!
 
+  "Guardian only. Re-sends a payment whose outcome is unknown, with its original BOB key, amount and account (CS-3949)."
+  retryJobPayment(jobId: ID!, expectedVersion: Int!, idempotencyKey: ID!): CsJobDecisionResult!
+
+  """
+  Child session only, for the child's own unsplit job pay (CS-3953). Each jar
+  at most once, exact cents, adding up to the whole unsplit balance at
+  expectedVersion. Runs under the child's session; BOB stamps origin child.
+  """
   splitUnsplit(childId: ID!, legs: [CsSplitLegInput!]!, expectedVersion: Int!, idempotencyKey: ID!): CsSplitResult!
 
   setCharityPreference(childId: ID!, bobCharityId: ID!, expectedVersion: Int, idempotencyKey: ID!): CsCharityPreference!

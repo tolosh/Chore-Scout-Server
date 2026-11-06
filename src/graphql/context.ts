@@ -5,11 +5,13 @@
  */
 import type { Db } from 'mongodb'
 import type { FastifyBaseLogger } from 'fastify'
+import type { BobFamilyClient } from '../bob/family.js'
 import type { Actor, SessionToken } from '../identity/principal.js'
 
-/** Outbound BOB ports. Later tickets add theirs; each takes the actor's own session. */
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-export interface BobPorts {}
+/** Outbound BOB clients (contract bob-family/1). Each person-route call takes the actor's own session. */
+export interface BobPorts {
+  family: BobFamilyClient
+}
 
 export interface Services {
   db: Db
