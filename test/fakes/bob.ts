@@ -87,6 +87,15 @@ export class FakeBob {
   readonly quotes = new Map<string, { child: string; amountCents: number; charityId: string; revision: number; expiresAt: Date; status: 'open' | 'confirmed' | 'superseded'; donationId?: string }>()
   /** §6.2 Give credits held as give_unresolved, per child. */
   readonly held = new Map<string, number>()
+  /** §7 standing authorities, by id. */
+  readonly authorities = new Map<
+    string,
+    { authorityId: string; version: number; status: 'active' | 'revoked'; bank: Bank; guardian: string; child: string; from: string; amountCents: number; split: { spend: number; save: number; give: number }; cycle: { period: string; start_date: string; timezone: string } }
+  >()
+  /** §2.1 allowance credentials (generated per test, never literals), by value: the bank each is bound to. */
+  readonly serviceCredentials = new Map<string, Bank>()
+  /** §7.5 SD-7: one completed allowance per child and cycle_ref, giving the execution id. */
+  readonly paidCycles = new Map<string, string>()
   readonly accounts = new Map<string, { owner: string; jar: 'spend' | 'save' | 'give' | 'funding'; balance: number }>()
 
   readonly people = new Map<string, Person>()
@@ -144,6 +153,18 @@ export class FakeBob {
     const s = this.sessions.get(token)
     if (!s || s.ended || s.accessExpiresAt <= this.clock()) return null
     return this.people.get(s.customerId) ?? null
+  }
+
+  /** A fresh allowance credential bound to one bank, generated at run time (§2.1). */
+  issueAllowanceCredential(bank: Bank = 'bank_bilgola'): string {
+    const c = `bobsvc_${randomBytes(24).toString('hex')}`
+    this.serviceCredentials.set(c, bank)
+    return c
+  }
+
+  /** §7.3 as an operator action in tests: the authority is revoked at once. */
+  revokeAuthority(authorityId: string): void {
+    this.authorities.get(authorityId)!.status = 'revoked'
   }
 
   activeLink(guardian: string, child: string): Link | undefined {
@@ -329,8 +350,125 @@ export function sweep(
   return { status: 'held', amount_cents: amountCents }
 }
 
+function authorityBody(a: FakeBob['authorities'] extends Map<string, infer V> ? V : never) {
+  return {
+    authority_id: a.authorityId,
+    version: a.version,
+    status: a.status,
+    bank_id: a.bank,
+    guardian_customer_id: a.guardian,
+    child_customer_id: a.child,
+    from_account_id: a.from,
+    amount_cents: a.amountCents,
+    currency: 'AUD',
+    split_cents: a.split,
+    cycle: a.cycle,
+    purposes: ['allowance'],
+    created_at: new Date(0).toISOString(),
+    recorded_against_session_id: 'ses_x',
+  }
+}
+
 /** bob-family/1 §4.1, §5 and §6. Later tickets' routes are installed alongside. */
 export function installFamilyRoutes(bob: FakeBob): void {
+
+  // §7.1: the Guardian records a standing authority for a linked child, under her own session.
+  bob.route('POST', /^\/api\/v1\/children\/([^/]+)\/standing-authorities$/, true, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    const childId = decodeURIComponent(c.params[0]!)
+    const child = bob.people.get(childId)
+    if (c.person.kind !== 'adult' || !child || child.bank !== c.person.bank || !bob.activeLink(c.person.customerId, childId)) return err(403, 'FORBIDDEN')
+    const b = c.body as { from_account_id?: unknown; amount_cents?: unknown; currency?: unknown; split_cents?: { spend?: unknown; save?: unknown; give?: unknown }; cycle?: { period?: unknown; start_date?: unknown; timezone?: unknown } }
+    const from = bob.accounts.get(String(b.from_account_id))
+    if (!from || from.owner !== c.person.customerId) return err(403, 'FORBIDDEN')
+    const sp = b.split_cents
+    if (!Number.isInteger(b.amount_cents) || (b.amount_cents as number) <= 0 || b.currency !== 'AUD' || !sp || ![sp.spend, sp.save, sp.give].every((n) => Number.isInteger(n) && (n as number) >= 0)) return err(400, 'VALIDATION_ERROR')
+    if ((sp.spend as number) + (sp.save as number) + (sp.give as number) !== b.amount_cents) return err(400, 'VALIDATION_ERROR')
+    if (!b.cycle || b.cycle.period !== 'weekly' || typeof b.cycle.start_date !== 'string' || typeof b.cycle.timezone !== 'string') return err(400, 'VALIDATION_ERROR')
+    for (const a of bob.authorities.values()) if (a.child === childId && a.status === 'active') return err(409, 'AUTHORITY_EXISTS', { authority_id: a.authorityId })
+    const a = {
+      authorityId: newId('sta'),
+      version: 1,
+      status: 'active' as const,
+      bank: c.person.bank,
+      guardian: c.person.customerId,
+      child: childId,
+      from: String(b.from_account_id),
+      amountCents: b.amount_cents as number,
+      split: { spend: sp.spend as number, save: sp.save as number, give: sp.give as number },
+      cycle: { period: 'weekly', start_date: b.cycle.start_date, timezone: b.cycle.timezone },
+    }
+    bob.authorities.set(a.authorityId, a)
+    return ok(201, authorityBody(a))
+  })
+
+  // §7.2: the owning Guardian changes the amount, split or source; the cycle can't change.
+  bob.route('PATCH', /^\/api\/v1\/standing-authorities\/([^/]+)$/, true, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    const a = bob.authorities.get(decodeURIComponent(c.params[0]!))
+    if (!a || c.person.kind !== 'adult' || a.guardian !== c.person.customerId) return err(403, 'FORBIDDEN')
+    if (a.status !== 'active') return err(409, 'AUTHORITY_REVOKED')
+    const b = c.body as { expected_version?: unknown; amount_cents?: unknown; split_cents?: { spend: number; save: number; give: number }; from_account_id?: unknown }
+    if (b.expected_version !== a.version) return err(409, 'STALE_VERSION')
+    const amount = (b.amount_cents ?? a.amountCents) as number
+    const split = b.split_cents ?? a.split
+    if (!Number.isInteger(amount) || amount <= 0 || split.spend + split.save + split.give !== amount) return err(400, 'VALIDATION_ERROR')
+    if (b.from_account_id !== undefined) {
+      const from = bob.accounts.get(String(b.from_account_id))
+      if (!from || from.owner !== c.person.customerId) return err(403, 'FORBIDDEN')
+      a.from = String(b.from_account_id)
+    }
+    a.amountCents = amount
+    a.split = { ...split }
+    a.version += 1
+    return ok(200, authorityBody(a))
+  })
+
+  // §7.5: executions under the allowance credential only. Checks in the contract's order; every refusal moves nothing.
+  bob.route('POST', /^\/api\/v1\/service\/standing-authorities\/([^/]+)\/executions$/, true, (c) => {
+    const bank = c.token ? bob.serviceCredentials.get(c.token) : undefined
+    if (c.person) return err(403, 'FORBIDDEN')
+    if (!bank) return err(401, 'UNAUTHORIZED')
+    const a = bob.authorities.get(decodeURIComponent(c.params[0]!))
+    if (!a || a.bank !== bank) return err(404, 'NOT_FOUND')
+    if (a.status !== 'active' || !bob.activeLink(a.guardian, a.child)) return err(409, 'AUTHORITY_REVOKED')
+    const b = c.body as { child_customer_id?: unknown; cycle_ref?: unknown; amount_cents?: unknown; instruction_ref?: unknown }
+    if (b.child_customer_id !== a.child) return err(403, 'CHILD_NOT_COVERED')
+    if (b.amount_cents !== a.amountCents) return err(422, 'AMOUNT_NOT_AUTHORISED')
+    const ref = String(b.cycle_ref)
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: a.cycle.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(bob.clock())
+    const offset = Math.round((Date.parse(`${ref}T00:00:00Z`) - Date.parse(`${a.cycle.start_date}T00:00:00Z`)) / 86_400_000)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ref) || Number.isNaN(offset) || offset < 0 || offset % 7 !== 0 || ref > today) return err(422, 'INVALID_CYCLE')
+    const paid = bob.paidCycles.get(`${a.child}|${ref}`)
+    if (paid) return err(409, 'CYCLE_ALREADY_PAID', { execution_id: paid })
+    if (bob.accounts.get(a.from)!.balance < a.amountCents) return err(422, 'INSUFFICIENT_FUNDS')
+    const spend = bob.accountOf(a.child, 'spend')!
+    const iref = String(b.instruction_ref)
+    const legs: Record<string, unknown>[] = [
+      { leg_id: move(bob, a.from, spend, a.amountCents, 'allowance_funding', iref), purpose: 'allowance_funding', from_account_id: a.from, to_account_id: spend, amount_cents: a.amountCents },
+    ]
+    for (const jar of ['save', 'give'] as const) {
+      if (a.split[jar] === 0) continue
+      const to = bob.accountOf(a.child, jar)!
+      legs.push({ leg_id: move(bob, spend, to, a.split[jar], 'split', iref, 'automatic'), purpose: 'split', origin: 'automatic', from_account_id: spend, to_account_id: to, amount_cents: a.split[jar] })
+    }
+    const give_outcome = a.split.give > 0 ? sweep(bob, a.child, a.split.give, iref) : { status: 'none' }
+    const executionId = newId('exe')
+    bob.paidCycles.set(`${a.child}|${ref}`, executionId)
+    return ok(201, {
+      execution_id: executionId,
+      status: 'completed',
+      authority_id: a.authorityId,
+      authority_version: a.version,
+      child_customer_id: a.child,
+      cycle_ref: ref,
+      instruction_ref: iref,
+      amount_cents: a.amountCents,
+      legs,
+      give_outcome,
+      completed_at: bob.clock().toISOString(),
+    })
+  })
   // §6.3: the child's own confirmation of where future Give credits go. Moves no money (HOLD-2).
   bob.route('PUT', /^\/api\/v1\/children\/me\/give-recipient$/, false, (c) => {
     if (!c.person) return err(401, 'UNAUTHORIZED')

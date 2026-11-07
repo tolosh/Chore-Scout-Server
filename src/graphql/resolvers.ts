@@ -1,4 +1,5 @@
 /** All resolvers, merged per type. Each ticket adds its own module here. */
+import { allowanceResolvers } from './allowance-resolvers.js'
 import { familySetupResolvers } from './family-setup-resolvers.js'
 import { identityResolvers } from './identity-resolvers.js'
 import { jobResolvers } from './job-resolvers.js'
@@ -20,4 +21,4 @@ export function mergeResolvers(...maps: ResolverMap[]): ResolverMap {
   return out
 }
 
-export const RESOLVERS: ResolverMap = mergeResolvers(identityResolvers, familySetupResolvers, jobResolvers, unsplitResolvers, givingResolvers)
+export const RESOLVERS: ResolverMap = mergeResolvers(identityResolvers, familySetupResolvers, jobResolvers, unsplitResolvers, givingResolvers, allowanceResolvers)

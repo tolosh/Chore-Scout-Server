@@ -181,7 +181,7 @@ input CsSplitInput {
   givePercent: Int!
 }
 
-"The Linked-mode chore condition, checked by the server at the cycle cut-off."
+"The Linked-mode chore condition, checked by the server at the cycle cut-off (the end of the product week, Monday 00:00 Australia/Sydney). A week with no chore assigned pays (D56)."
 enum CsLinkedCondition {
   WEEK_CHORES_DONE
 }
@@ -613,12 +613,16 @@ type Mutation {
     mode: CsAllowanceMode!
     amount: CsMoneyInput!
     cadence: CsCadence!
+    "Must be a Monday: every allowance week runs Monday 00:00 to Monday 00:00 Australia/Sydney (D55). Anything else is INVALID."
     startDate: CsDate!
+    "Must be Australia/Sydney (D55). Anything else is INVALID."
     timezone: String!
     defaultSplit: CsSplitInput!
     linkedCondition: CsLinkedCondition
     expectedVersion: Int
     idempotencyKey: ID!
+    "The Guardian's own funding account for the standing authority (bob-family/1 §7.1). Required on first set-up; omit to keep it."
+    fromAccountId: ID
   ): CsAllowanceRule!
 
   "Guardian only, for a linked child (CS-3949). A good deed carries points only; other kinds carry a reward (a HOME_JOB chore may have none)."
