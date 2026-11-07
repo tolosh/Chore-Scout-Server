@@ -10,6 +10,9 @@
  *   rule's amount always equals BOB's authorised amount.
  * - A mode or amount change applies from the period in which it is made
  *   (`effectiveFrom`); undecided earlier periods are never paid (no backfill).
+ * - A change to the mode, amount, split or source account is refused
+ *   (NOT_ALLOWED_IN_STATE) while a PAY cycle is still unsettled with BOB, so
+ *   a decided payment always settles under the rule it was decided on.
  * - D55: the week is Monday 00:00 to Monday 00:00 Australia/Sydney for every
  *   child. Any other timezone, or a startDate that isn't a Monday, is refused
  *   (INVALID) before BOB is called.
@@ -26,9 +29,11 @@ import { forbidden, invalid, notAllowedInState, stale, unauthenticated, upstream
 import { assertGuardianOf } from '../identity/authz.js'
 import type { Actor } from '../identity/principal.js'
 import { toCents, type MoneyInput } from '../money.js'
-import { isDate, isTimezone, isWeekStart, localDate, periodContaining, PRODUCT_TIMEZONE, type AllowanceMode } from './decide.js'
+import { addDays, cycleKeyOf, isDate, isTimezone, isWeekStart, localDate, periodContaining, PRODUCT_TIMEZONE, type AllowanceMode } from './decide.js'
 
 export const RULES = 'allowance_rules'
+/** cycle.ts's CYCLES, named here to keep the module graph acyclic (cycle.ts imports this file). */
+const CYCLES = 'allowance_cycles'
 const KEY_RE = /^[A-Za-z0-9._:-]{8,128}$/
 const KEEP_KEYS = 20
 
@@ -199,8 +204,13 @@ export class AllowanceRuleService {
     }
     const fromAccountId = i.fromAccountId ?? doc.fromAccountId
     const sameSplit = v.splitCents.spend === doc.splitCents.spend && v.splitCents.save === doc.splitCents.save && v.splitCents.give === doc.splitCents.give
+    const changesAuthority = v.amountCents !== doc.amountCents || !sameSplit || fromAccountId !== doc.fromAccountId
+    const changesPay = i.mode !== doc.mode || v.amountCents !== doc.amountCents || v.linkedCondition !== doc.linkedCondition
+    // CS-3979 review 40015 R1, R2: a payment already decided but not yet settled with BOB is paid under the
+    // rule it was decided on. Refuse any change to what is paid until BOB has answered for it.
+    if (changesAuthority || changesPay) await this.assertNoUnsettledPayment(doc, v.today)
     let authorityVersion = doc.authorityVersion
-    if (v.amountCents !== doc.amountCents || !sameSplit || fromAccountId !== doc.fromAccountId) {
+    if (changesAuthority) {
       // SD-7: BOB first. If BOB refuses, nothing here is saved.
       const out = await this.bob.change(actor.session, doc.authorityId, doc.authorityVersion, { amountCents: v.amountCents, splitCents: v.splitCents, fromAccountId })
       if (out.kind !== 'ok') this.refusal(out)
@@ -210,7 +220,6 @@ export class AllowanceRuleService {
       authorityVersion = out.value.version
     }
     const now = this.now()
-    const changesPay = i.mode !== doc.mode || v.amountCents !== doc.amountCents || v.linkedCondition !== doc.linkedCondition
     const effectiveFrom = changesPay ? periodContaining(doc.startDate, v.today) : doc.effectiveFrom
     const set = {
       mode: i.mode,
@@ -229,6 +238,26 @@ export class AllowanceRuleService {
     const after: AllowanceRuleDoc = { ...doc, ...set, version: doc.version + 1 }
     await audit(this.db, { actor: p.customerId, tenantId: doc.tenantId, action: 'allowance.rule_changed', subject: doc.childCustomerId, before: this.summary(doc), after: this.summary(after), correlation }, now)
     return after
+  }
+
+  /**
+   * NOT_ALLOWED_IN_STATE while any PAY cycle of this child is still DECIDED (its BOB
+   * outcome unknown, or held for an operator). Read by cycleKey on its unique index:
+   * every period from the rule's start date to the current one.
+   */
+  private async assertNoUnsettledPayment(doc: AllowanceRuleDoc, today: string): Promise<void> {
+    const keys: string[] = []
+    const last = periodContaining(doc.startDate, today)
+    for (let p = doc.startDate; p <= last; p = addDays(p, 7)) keys.push(cycleKeyOf(doc.childCustomerId, p))
+    const open = await this.db
+      .collection<{ cycleKey: string; periodStart: string; decision: string; status: string; operatorHold?: string | null }>(CYCLES)
+      .findOne({ cycleKey: { $in: keys }, decision: 'PAY', status: 'DECIDED' }, { projection: { _id: 0, periodStart: 1, operatorHold: 1 } })
+    if (open?.operatorHold) {
+      throw notAllowedInState(`the allowance payment for the week starting ${open.periodStart} is being checked by support; the allowance can't be changed until that check is done`)
+    }
+    if (open) {
+      throw notAllowedInState(`the allowance for the week starting ${open.periodStart} is still being paid by the bank; try the change again once that payment has settled`)
+    }
   }
 
   private summary(d: AllowanceRuleDoc) {

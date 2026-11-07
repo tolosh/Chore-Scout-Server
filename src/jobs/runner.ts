@@ -1,10 +1,11 @@
 /**
  * Single-runner job host (CS-3941; required by the CS-3941 comment on revised SD-2).
  *
- * The scaffold hosts scheduled jobs but registers none: the allowance-cycle job
- * is CS-3979. Each tick acquires or renews the "scheduler" lease; only the
- * holder runs jobs, and each run receives the lease's fencing token. Jobs must
- * be idempotent per their own key (for the allowance job, the cycle key).
+ * Each tick acquires or renews the "scheduler" lease; only the holder runs
+ * jobs, and each run receives the lease's fencing token and a `stillLeader`
+ * check to make before each external action. Jobs must be idempotent per their
+ * own key (for the allowance job, the cycle key). The jobs process registers
+ * its jobs in registry.ts (CS-3979: the allowance-cycle job).
  */
 import type { Db } from 'mongodb'
 import type { Logger } from 'pino'
@@ -15,15 +16,14 @@ export interface JobContext {
   fencingToken: number
   now: Date
   log: Pick<Logger, 'info' | 'warn' | 'error'>
+  /** True while this runner still holds the scheduler lease with `fencingToken`. */
+  stillLeader: () => Promise<boolean>
 }
 
 export interface ScheduledJob {
   name: string
   run(ctx: JobContext): Promise<void>
 }
-
-/** Registered jobs. Empty in the scaffold; CS-3979 adds the allowance-cycle job. */
-export const JOBS: readonly ScheduledJob[] = []
 
 export const SCHEDULER_LEASE = 'scheduler'
 
@@ -53,7 +53,7 @@ export class JobRunner {
     const failed: string[] = []
     for (const job of this.jobs) {
       try {
-        await job.run({ db: this.db, fencingToken: lease.token, now: this.now(), log: this.log })
+        await job.run({ db: this.db, fencingToken: lease.token, now: this.now(), log: this.log, stillLeader: () => this.lock.holds(SCHEDULER_LEASE, this.holder, lease.token) })
         ran.push(job.name)
       } catch (err) {
         failed.push(job.name)

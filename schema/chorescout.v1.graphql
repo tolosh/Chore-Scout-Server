@@ -607,7 +607,7 @@ on retry), and an expected version where state can go stale.
 type Mutation {
   startFamilySetup(setupRef: ID!, children: [CsSetupChildInput!]!): CsFamilySetup!
 
-  "An amount change updates the Guardian's BOB standing authority; if BOB refuses, the rule is not saved (SD-7)."
+  "An amount change updates the Guardian's BOB standing authority; if BOB refuses, the rule is not saved (SD-7). A change to the mode, amount, split or source account is NOT_ALLOWED_IN_STATE while an allowance payment is still being settled with the bank; the message says which week."
   setAllowance(
     childId: ID!
     mode: CsAllowanceMode!
