@@ -5,13 +5,19 @@
  */
 import type { Db } from 'mongodb'
 import type { FastifyBaseLogger } from 'fastify'
-import type { BobFamilyClient } from '../bob/family.js'
+import { BobFamilyClient, BobGivingClient } from '../bob/family.js'
+import type { BobHttp } from '../bob/http.js'
 import type { Actor, SessionToken } from '../identity/principal.js'
 
 /** Outbound BOB clients (contract bob-family/1). Each person-route call takes the actor's own session. */
 export interface BobPorts {
   family: BobFamilyClient
+  /** §6.3-§6.5: the child's Give recipient, held Give and its release. */
+  giving: BobGivingClient
 }
+
+/** Every person-route client over one BOB HTTP adapter. */
+export const bobPorts = (http: BobHttp): BobPorts => ({ family: new BobFamilyClient(http), giving: new BobGivingClient(http) })
 
 export interface Services {
   db: Db

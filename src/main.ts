@@ -1,7 +1,7 @@
 /** API process entry point. */
 import { hostname } from 'node:os'
 import { buildApp } from './app.js'
-import { BobFamilyClient } from './bob/family.js'
+import { bobPorts } from './graphql/context.js'
 import { BobHttp } from './bob/http.js'
 import { BobSessionCheck } from './bob/session-check.js'
 import { bootConfig } from './boot.js'
@@ -44,7 +44,7 @@ const app = buildApp({
     services: {
       db,
       // bob-family/1 person routes. Without BOB_API_URL the session check refuses every request first.
-      bob: { family: new BobFamilyClient(new BobHttp({ baseUrl: config.BOB_API_URL ?? 'http://bob.unconfigured.invalid', timeoutMs: config.BOB_CALL_TIMEOUT_MS, onUnauthorized: (s) => invalidate(s) })) },
+      bob: bobPorts(new BobHttp({ baseUrl: config.BOB_API_URL ?? 'http://bob.unconfigured.invalid', timeoutMs: config.BOB_CALL_TIMEOUT_MS, onUnauthorized: (s) => invalidate(s) })),
       sessions: { invalidate: (s) => invalidate(s) },
       now: () => new Date(),
     },

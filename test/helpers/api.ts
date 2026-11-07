@@ -2,8 +2,8 @@
 import type { Db } from 'mongodb'
 import { buildApp } from '../../src/app.js'
 import { BobSessionCheck } from '../../src/bob/session-check.js'
-import { BobFamilyClient } from '../../src/bob/family.js'
 import { BobHttp } from '../../src/bob/http.js'
+import { bobPorts } from '../../src/graphql/context.js'
 import { RESOLVERS } from '../../src/graphql/resolvers.js'
 import { buildExecutableSchema } from '../../src/graphql/schema.js'
 import { CachedSessionCheck } from '../../src/identity/session-check.js'
@@ -18,7 +18,7 @@ export function buildTestApi(opts: { db: Db; bob: FakeBob; now?: () => number; t
     now: opts.now,
   })
   const http = new BobHttp({ baseUrl: BOB_URL, timeoutMs: 1_000, fetch: opts.bob.fetch, onUnauthorized: (s) => cache.invalidate(s) })
-  const ports = { family: new BobFamilyClient(http) }
+  const ports = bobPorts(http)
   const app = buildApp({
     gitSha: VALID_SHA,
     logLevel: 'silent',

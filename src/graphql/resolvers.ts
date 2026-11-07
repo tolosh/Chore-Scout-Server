@@ -2,6 +2,7 @@
 import { familySetupResolvers } from './family-setup-resolvers.js'
 import { identityResolvers } from './identity-resolvers.js'
 import { jobResolvers } from './job-resolvers.js'
+import { givingResolvers } from './giving-resolvers.js'
 import { unsplitResolvers } from './unsplit-resolvers.js'
 import type { ResolverMap } from './schema.js'
 
@@ -19,4 +20,4 @@ export function mergeResolvers(...maps: ResolverMap[]): ResolverMap {
   return out
 }
 
-export const RESOLVERS: ResolverMap = mergeResolvers(identityResolvers, familySetupResolvers, jobResolvers, unsplitResolvers)
+export const RESOLVERS: ResolverMap = mergeResolvers(identityResolvers, familySetupResolvers, jobResolvers, unsplitResolvers, givingResolvers)

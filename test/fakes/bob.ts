@@ -79,8 +79,12 @@ export class FakeBob {
   /** Every completed money movement BOB made (its ledger), for evidence in tests. */
   readonly ledger: { paymentId: string; purpose: string; origin?: string; from: string; to: string; amountCents: number; ref: string }[] = []
   readonly jobPayments = new Map<string, string>()
-  /** §6.3 confirmed Give recipient per child: the charity's account id (set directly in tests). */
-  readonly recipients = new Map<string, string>()
+  /** Charities BOB can route to (Odyssey's live lookup, SD-6), by BOB charity id. */
+  readonly charities = new Map<string, { name: string; bank: Bank; enabled: boolean; revision: number; account: string }>()
+  /** §6.3 the child's own confirmed Give recipient (D51), pinned to the revision confirmed. */
+  readonly recipients = new Map<string, { charityId: string; revision: number }>()
+  /** §6.5 release quotes. */
+  readonly quotes = new Map<string, { child: string; amountCents: number; charityId: string; revision: number; expiresAt: Date; status: 'open' | 'confirmed' | 'superseded'; donationId?: string }>()
   /** §6.2 Give credits held as give_unresolved, per child. */
   readonly held = new Map<string, number>()
   readonly accounts = new Map<string, { owner: string; jar: 'spend' | 'save' | 'give' | 'funding'; balance: number }>()
@@ -196,6 +200,12 @@ export class FakeBob {
     return id
   }
 
+  /** A synthetic charity with its own receiving account. */
+  addCharity(charityId: string, name: string, bank: Bank = 'bank_bilgola'): string {
+    this.charities.set(charityId, { name, bank, enabled: true, revision: 1, account: this.openAccount(charityId, 'spend') })
+    return charityId
+  }
+
   balance(owner: string, jar: 'spend' | 'save' | 'give' | 'funding'): number {
     const id = this.accountOf(owner, jar)
     return id ? this.accounts.get(id)!.balance : 0
@@ -301,25 +311,89 @@ export function move(bob: FakeBob, from: string, to: string, amountCents: number
   return paymentId
 }
 
-/** §6.2: a Give credit is donated at once to the confirmed recipient, or held. */
+/** §6.2: a Give credit is donated at once to the child's confirmed recipient if it resolves (enabled), otherwise held (D51). */
 export function sweep(
   bob: FakeBob,
   childId: string,
   amountCents: number,
   ref: string,
 ): { status: 'donated' | 'held'; donation_id?: string; amount_cents: number; recipient?: { charity_id: string; revision: number } } {
-  const to = bob.recipients.get(childId)
-  if (to) {
-    const donation = move(bob, bob.accountOf(childId, 'give')!, to, amountCents, 'donation', ref)
-    return { status: 'donated', donation_id: donation.replace('pay_', 'don_'), amount_cents: amountCents, recipient: { charity_id: to, revision: 1 } }
+  const r = bob.recipients.get(childId)
+  const c = r ? bob.charities.get(r.charityId) : undefined
+  if (r && c && c.enabled) {
+    const donation = move(bob, bob.accountOf(childId, 'give')!, c.account, amountCents, 'donation', ref)
+    return { status: 'donated', donation_id: donation.replace('pay_', 'don_'), amount_cents: amountCents, recipient: { charity_id: r.charityId, revision: c.revision } }
   }
   bob.held.set(childId, (bob.held.get(childId) ?? 0) + amountCents)
   bob.ledger.push({ paymentId: newId('pay'), purpose: 'give_unresolved', from: bob.accountOf(childId, 'give')!, to: bob.accountOf(childId, 'give')!, amountCents, ref })
   return { status: 'held', amount_cents: amountCents }
 }
 
-/** bob-family/1 §4.1, §5 and §6.1. Later tickets' routes are installed alongside. */
+/** bob-family/1 §4.1, §5 and §6. Later tickets' routes are installed alongside. */
 export function installFamilyRoutes(bob: FakeBob): void {
+  // §6.3: the child's own confirmation of where future Give credits go. Moves no money (HOLD-2).
+  bob.route('PUT', /^\/api\/v1\/children\/me\/give-recipient$/, false, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    if (c.person.kind !== 'child') return err(403, 'FORBIDDEN')
+    const id = c.body.charity_id
+    if (typeof id !== 'string' || Object.keys(c.body).length !== 1) return err(400, 'VALIDATION_ERROR')
+    const ch = bob.charities.get(id)
+    if (ch && ch.bank !== c.person.bank) return err(403, 'FORBIDDEN')
+    if (!ch || !ch.enabled) return err(422, 'CHARITY_NOT_ELIGIBLE')
+    bob.recipients.set(c.person.customerId, { charityId: id, revision: ch.revision })
+    return ok(200, { charity_id: id, revision: ch.revision, confirmed_at: bob.clock().toISOString(), eligible: true })
+  })
+
+  // §6.4: held Give, read only; the child themselves or a Guardian with an active link.
+  bob.route('GET', /^\/api\/v1\/children\/([^/]+)\/give\/held$/, false, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    const raw = decodeURIComponent(c.params[0]!)
+    const child = raw === 'me' && c.person.kind === 'child' ? c.person.customerId : raw
+    const self = c.person.kind === 'child' && child === c.person.customerId
+    const guardian = c.person.kind === 'adult' && !!bob.activeLink(c.person.customerId, child)
+    if (!self && !guardian) return err(403, 'FORBIDDEN')
+    const held = bob.held.get(child) ?? 0
+    return ok(200, { child_customer_id: child, held_cents: held, currency: 'AUD', held_since: held > 0 ? bob.clock().toISOString() : null, entries: held > 0 ? 1 : 0 })
+  })
+
+  // §6.5 quote: all money held now, to a named eligible charity, for 5 minutes. A new quote supersedes the open one.
+  bob.route('POST', /^\/api\/v1\/children\/me\/give\/release-quotes$/, false, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    if (c.person.kind !== 'child') return err(403, 'FORBIDDEN')
+    const child = c.person.customerId
+    const ch = typeof c.body.charity_id === 'string' ? bob.charities.get(c.body.charity_id) : undefined
+    if (ch && ch.bank !== c.person.bank) return err(403, 'FORBIDDEN')
+    const held = bob.held.get(child) ?? 0
+    if (held === 0) return err(422, 'NOTHING_HELD')
+    if (!ch || !ch.enabled) return err(422, 'CHARITY_NOT_ELIGIBLE')
+    for (const q of bob.quotes.values()) if (q.child === child && q.status === 'open') q.status = 'superseded'
+    const quoteId = newId('qte')
+    const expiresAt = new Date(bob.clock().getTime() + 5 * 60_000)
+    bob.quotes.set(quoteId, { child, amountCents: held, charityId: c.body.charity_id as string, revision: ch.revision, expiresAt, status: 'open' })
+    return ok(201, { quote_id: quoteId, amount_cents: held, currency: 'AUD', recipient: { charity_id: c.body.charity_id, name: ch.name, revision: ch.revision }, expires_at: expiresAt.toISOString() })
+  })
+
+  // §6.5 confirm: one payment per quote whatever the key; anything changed gives FRESH_QUOTE_NEEDED and moves nothing (HOLD-4).
+  bob.route('POST', /^\/api\/v1\/children\/me\/give\/release-quotes\/([^/]+)\/confirm$/, true, (c) => {
+    if (!c.person) return err(401, 'UNAUTHORIZED')
+    const q = bob.quotes.get(decodeURIComponent(c.params[0]!))
+    if (c.person.kind !== 'child' || !q || q.child !== c.person.customerId) return err(403, 'FORBIDDEN')
+    if (q.status === 'confirmed') return err(409, 'QUOTE_ALREADY_CONFIRMED', { donation_id: q.donationId })
+    const fresh = (reason: string) => err(409, 'FRESH_QUOTE_NEEDED', { reason })
+    if (q.status === 'superseded') return fresh('superseded')
+    if (bob.clock() >= q.expiresAt) return fresh('expired')
+    const ch = bob.charities.get(q.charityId)!
+    if (c.body.amount_cents !== q.amountCents || (bob.held.get(q.child) ?? 0) !== q.amountCents) return fresh('amount_changed')
+    if (c.body.charity_id !== q.charityId) return fresh('recipient_changed')
+    if (!ch.enabled) return fresh('recipient_disabled')
+    if (c.body.revision !== q.revision || ch.revision !== q.revision) return fresh('revision_changed')
+    const pay = move(bob, bob.accountOf(q.child, 'give')!, ch.account, q.amountCents, 'donation_release', c.params[0]!)
+    bob.held.set(q.child, 0)
+    q.status = 'confirmed'
+    q.donationId = pay.replace('pay_', 'don_')
+    return ok(201, { donation_id: q.donationId, status: 'completed', purpose: 'donation_release', amount_cents: q.amountCents, recipient: { charity_id: q.charityId, revision: q.revision }, completed_at: bob.clock().toISOString() })
+  })
+
   bob.route('POST', /^\/api\/v1\/children\/me\/allocations$/, true, (c) => {
     if (!c.person) return err(401, 'UNAUTHORIZED')
     if (c.person.kind !== 'child') return err(403, 'FORBIDDEN')

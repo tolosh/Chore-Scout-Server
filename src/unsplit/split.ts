@@ -28,6 +28,7 @@ import type { BobFamilyClient, BobJar } from '../bob/family.js'
 import { invalid, stale, unauthenticated } from '../errors.js'
 import { assertChildSelf } from '../identity/authz.js'
 import type { Actor } from '../identity/principal.js'
+import { markUnavailable, reconcileWithSweep } from '../giving/preference.js'
 import { debitForSplit, readLedger, restoreFailedSplit } from './ledger.js'
 
 export type Jar = 'SPEND' | 'SAVE' | 'GIVE'
@@ -219,6 +220,12 @@ export class SplitService {
       }
     }
     const done = (await this.ops.findOne({ idempotencyKey: op.idempotencyKey }, { projection: { _id: 0 } }))!
+    // BOB held the Give share: whatever the server showed as AVAILABLE, BOB couldn't resolve it (D51, HOLD-1).
+    if (done.giveOutcome?.status === 'HELD') await markUnavailable(this.db, done.childCustomerId, now)
+    // BOB donated: its recipient is what BOB has for the child; keep the server's charity in step (D51).
+    if (done.giveOutcome?.status === 'DONATED' && done.giveOutcome.recipient) {
+      await reconcileWithSweep(this.db, done.childCustomerId, done.tenantId, done.giveOutcome.recipient, now, correlation)
+    }
     if (done.status !== 'PENDING') {
       await audit(this.db, { actor: actor.principal.customerId, tenantId: done.tenantId, action: `unsplit.split_${done.status.toLowerCase()}`, subject: done.idempotencyKey, after: { giveOutcome: done.giveOutcome, reason: done.reason }, correlation }, now)
     }
