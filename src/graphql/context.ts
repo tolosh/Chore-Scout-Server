@@ -5,6 +5,7 @@
  */
 import type { Db } from 'mongodb'
 import type { FastifyBaseLogger } from 'fastify'
+import { BobAuthorityClient } from '../bob/allowance.js'
 import { BobFamilyClient, BobGivingClient } from '../bob/family.js'
 import type { BobHttp } from '../bob/http.js'
 import type { Actor, SessionToken } from '../identity/principal.js'
@@ -14,10 +15,12 @@ export interface BobPorts {
   family: BobFamilyClient
   /** §6.3-§6.5: the child's Give recipient, held Give and its release. */
   giving: BobGivingClient
+  /** §7.1, §7.2: the Guardian's standing authority, under her own session. */
+  authority: BobAuthorityClient
 }
 
 /** Every person-route client over one BOB HTTP adapter. */
-export const bobPorts = (http: BobHttp): BobPorts => ({ family: new BobFamilyClient(http), giving: new BobGivingClient(http) })
+export const bobPorts = (http: BobHttp): BobPorts => ({ family: new BobFamilyClient(http), giving: new BobGivingClient(http), authority: new BobAuthorityClient(http) })
 
 export interface Services {
   db: Db

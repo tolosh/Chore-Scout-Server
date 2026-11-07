@@ -1,5 +1,5 @@
-/** CS-3962 resolvers: giving(childId), setCharityPreference. Held-Give review and release follow in CS-3957. */
-import { CsError } from '../errors.js'
+/** CS-3962 and CS-3957 resolvers: giving(childId), setCharityPreference, heldGiving and confirmHeldRelease. */
+import { HeldGiveService, type HeldView, type ReleaseOperationDoc } from '../giving/held.js'
 import { assertChildAccess } from '../identity/authz.js'
 import { money } from '../money.js'
 import { availabilityOf, CharityPreferenceService, readPreference, type CharityPreferenceDoc } from '../giving/preference.js'
@@ -12,6 +12,18 @@ export const preferenceToGraph = (d: CharityPreferenceDoc | null) =>
     ? { childCustomerId: d.childCustomerId, bobCharityId: d.bobCharityId, version: d.version, revision: d.revision, confirmedAt: d.confirmedAt?.toISOString() ?? null, availability: availabilityOf(d) }
     : null
 
+const heldToGraph = (v: HeldView | null) =>
+  v && {
+    childCustomerId: v.childCustomerId,
+    amount: money(v.amountCents),
+    recipientName: v.recipientName,
+    recipientUnavailable: v.recipientUnavailable,
+    reviewVersion: v.reviewVersion,
+    confirmedAt: v.confirmedAt?.toISOString() ?? null,
+  }
+
+const releaseToGraph = (o: ReleaseOperationDoc) => ({ idempotencyKey: o.idempotencyKey, kind: o.kind, status: o.status, bobOperationRef: o.bobOperationRef, amount: money(o.amountCents), reason: o.reason })
+
 export const givingResolvers: ResolverMap = {
   Query: {
     giving: async (_r, a: { childId: string }, ctx: RequestContext) => {
@@ -22,10 +34,8 @@ export const givingResolvers: ResolverMap = {
     },
   },
   CsGiving: {
-    /** Not built in this PR (CS-3957). A null here would wrongly read as "nothing held", so the field refuses instead. */
-    heldGiving: () => {
-      throw new CsError('UPSTREAM_UNAVAILABLE', 'CsGiving.heldGiving is not built in this release')
-    },
+    /** CS-3957: BOB's held amount, live; the child also gets a reviewable quote (§6.5). Null when nothing is held. */
+    heldGiving: async (g: { childCustomerId: string }, _a, ctx: RequestContext) => heldToGraph(await new HeldGiveService(ctx.db, ctx.bob.giving, ctx.now).review(ctx.actor, g.childCustomerId)),
     /** Immediate donations the server saw BOB complete (split Give legs); BOB's ledger is the record. */
     donations: async (g: { childCustomerId: string }, _a, ctx: RequestContext) => {
       const ops = await ctx.db
@@ -38,6 +48,10 @@ export const givingResolvers: ResolverMap = {
     },
   },
   Mutation: {
+    confirmHeldRelease: async (_r, a: { childId: string; reviewVersion: number; idempotencyKey: string }, ctx: RequestContext) => {
+      const r = await new HeldGiveService(ctx.db, ctx.bob.giving, ctx.now).confirm(ctx.actor, a.childId, a.reviewVersion, a.idempotencyKey, ctx.correlationId)
+      return { review: heldToGraph(r.review), operation: releaseToGraph(r.operation) }
+    },
     setCharityPreference: async (_r, a: { childId: string; bobCharityId: string; expectedVersion?: number | null; idempotencyKey: string }, ctx: RequestContext) => {
       const d = await new CharityPreferenceService(ctx.db, ctx.bob.giving, ctx.now).set(ctx.actor, a.childId, a.bobCharityId, a.expectedVersion, a.idempotencyKey, ctx.correlationId)
       // A first choice still pending can't be shown as confirmed; the service throws in that case, so d is settled here.
