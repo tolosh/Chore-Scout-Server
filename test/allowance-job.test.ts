@@ -8,7 +8,7 @@
 import { readFileSync } from 'node:fs'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { Db } from 'mongodb'
-import { AllowanceCycleService, CYCLES, SEND_CLAIM_MS } from '../src/allowance/cycle.js'
+import { AllowanceCycleService, CYCLES, MAX_MISMATCH_ATTEMPTS, SEND_CLAIM_MS } from '../src/allowance/cycle.js'
 import { BobAllowanceExecutor } from '../src/bob/allowance.js'
 import { BobHttp } from '../src/bob/http.js'
 import { AllowanceCycleJob, RETRY_AFTER_MS } from '../src/jobs/allowance-job.js'
@@ -346,5 +346,131 @@ describe('interruption and retry', () => {
     await tick()
     expect(funding()).toHaveLength(1)
     expect(new Set(execCalls().map((c) => c.key))).toEqual(new Set([`cs:${LEO}:${P1}:allowance`]))
+  })
+})
+
+const CHANGE = `mutation($c: ID!, $m: CsAllowanceMode!, $a: String!, $sp: CsSplitInput!, $f: ID, $v: Int!, $key: ID!) {
+  setAllowance(childId: $c, mode: $m, amount: { amount: $a, currency: "AUD" }, cadence: WEEKLY, startDate: "${START}", timezone: "Australia/Sydney", defaultSplit: $sp, expectedVersion: $v, idempotencyKey: $key, fromAccountId: $f) { version amount { amount } }
+}`
+async function change(o: { key: string; m?: string; a?: string; sp?: [number, number, number]; f?: string | null; v?: number }) {
+  const x = api()
+  const sp = o.sp ?? [50, 30, 20]
+  const r = await x.gql(bob.signIn(SARAH), CHANGE, { c: LEO, m: o.m ?? 'FREE', a: o.a ?? '10.00', sp: { spendPercent: sp[0], savePercent: sp[1], givePercent: sp[2] }, f: o.f ?? null, v: o.v ?? 1, key: K(o.key) })
+  await x.app.close()
+  return r.body as { data?: { setAllowance: { version: number; amount: { amount: string } } } | null; errors?: { message: string; extensions?: { code?: string } }[] }
+}
+const codeOfBody = (b: { errors?: { extensions?: { code?: string } }[] }) => b.errors?.[0]?.extensions?.code
+const authorityChanges = () => bob.calls.filter((c) => c.method === 'PATCH' && /\/standing-authorities\//.test(c.path))
+
+describe('review 40015 R1, R2: a decided payment settles under the rule it was decided on', () => {
+  it('RV13-2a: a lost answer, then Sarah changes the amount: refused until the retry settles it; then one 10.00 payment and the change saves', async () => {
+    await setUp(LEO)
+    t = syd(P2, 0, 1)
+    bob.dropResponses = { re: /\/executions$/, count: 1 }
+    await tick()
+    expect(await cycleDocs()).toMatchObject([{ cycleKey: `${LEO}:${P1}`, status: 'DECIDED', bobReason: 'UPSTREAM_UNAVAILABLE' }])
+    t += 10_000
+    const r = await change({ key: 'job-rv2a-chg1', a: '15.00' })
+    expect(codeOfBody(r)).toBe('NOT_ALLOWED_IN_STATE')
+    expect(r.errors![0]!.message).toMatch(/week starting 2026-11-09 is still being paid/)
+    expect(authorityChanges()).toHaveLength(0)
+    expect(authorityOf(LEO).amountCents).toBe(1000)
+    t += RETRY_AFTER_MS
+    await tick()
+    expect(await cycleDocs()).toMatchObject([{ status: 'EXECUTED', amountCents: 1000 }])
+    expect(funding().map((l) => l.amountCents)).toEqual([1000])
+    expect((await change({ key: 'job-rv2a-chg2', a: '15.00' })).data!.setAllowance).toMatchObject({ version: 2, amount: { amount: '15.00' } })
+  })
+
+  it('RV13-2b and RV13-5: a 503 before BOB records it; mode, amount, split and source changes are all refused; the retry pays once at the decided split', async () => {
+    await setUp(LEO)
+    t = syd(P2, 0, 1)
+    bob.failBefore = { re: /\/executions$/, count: 1, status: 503, code: 'UNAVAILABLE' }
+    await tick()
+    expect(funding()).toHaveLength(0)
+    t += 10_000
+    for (const [key, o] of [
+      ['job-rv2b-mode', { m: 'EARNED' }],
+      ['job-rv2b-amt1', { a: '15.00' }],
+      ['job-rv2b-splt', { sp: [60, 20, 20] as [number, number, number] }],
+      ['job-rv2b-srce', { f: bob.accountOf(SARAH, 'save') ?? 'acct_other' }],
+    ] as const) {
+      expect(codeOfBody(await change({ key, ...o })), key).toBe('NOT_ALLOWED_IN_STATE')
+    }
+    expect(authorityChanges()).toHaveLength(0)
+    t += RETRY_AFTER_MS
+    await tick()
+    expect(await cycleDocs()).toMatchObject([{ status: 'EXECUTED', bobReason: null }])
+    expect(bob.ledger.filter((l) => l.purpose === 'split').map((l) => l.amountCents)).toEqual([300, 200])
+    expect(funding()).toHaveLength(1)
+    t += 2 * RETRY_AFTER_MS
+    await tick()
+    expect(execCalls()).toHaveLength(2)
+  })
+
+  it('a change with nothing unsettled (no cycle yet, or every PAY settled) is not blocked', async () => {
+    await setUp(LEO)
+    t = syd('2026-11-11')
+    expect((await change({ key: 'job-free-chg1', a: '12.00' })).data!.setAllowance).toMatchObject({ version: 2 })
+    t = syd(P2, 0, 1)
+    await tick()
+    expect(await cycleDocs()).toMatchObject([{ status: 'EXECUTED', amountCents: 1200 }])
+    expect((await change({ key: 'job-free-chg2', a: '13.00', v: 2 })).data!.setAllowance).toMatchObject({ version: 3 })
+  })
+})
+
+describe('review 40015 optional 4: a 201 that keeps not matching is capped and held for an operator', () => {
+  it('re-sent at most MAX_MISMATCH_ATTEMPTS times, each audited; then held, alerted at error level, never re-sent, and Sarah is told it is being checked', async () => {
+    await setUp(LEO)
+    bob.mutateFamily = (d) => {
+      if ('execution_id' in d) d.amount_cents = 1100
+    }
+    t = syd(P2, 0, 1)
+    for (let i = 0; i < MAX_MISMATCH_ATTEMPTS + 3; i++) {
+      await tick()
+      t += RETRY_AFTER_MS
+    }
+    expect(execCalls()).toHaveLength(MAX_MISMATCH_ATTEMPTS)
+    expect(funding()).toHaveLength(1) // BOB paid once; the replays moved nothing
+    expect(await cycleDocs()).toMatchObject([{ status: 'DECIDED', bobReason: 'UPSTREAM_MISMATCH', mismatches: MAX_MISMATCH_ATTEMPTS, operatorHold: 'UPSTREAM_MISMATCH' }])
+    expect(await db.collection('audit').countDocuments({ action: 'allowance.cycle_mismatch' })).toBe(MAX_MISMATCH_ATTEMPTS - 1)
+    expect(await db.collection('audit').countDocuments({ action: 'allowance.cycle_operator_hold' })).toBe(1)
+    expect(logs.filter((l) => l.level === 'error' && l.msg.startsWith('allowance cycle held for an operator'))).toHaveLength(1)
+    bob.mutateFamily = null
+    const r = await change({ key: 'job-hold-chg1', a: '15.00' })
+    expect(codeOfBody(r)).toBe('NOT_ALLOWED_IN_STATE')
+    expect(r.errors![0]!.message).toMatch(/being checked by support/)
+  })
+})
+
+describe('review 40015 optional probes', () => {
+  it('RV13-6: three concurrent retries of a DECIDED cycle re-send once', async () => {
+    await setUp(LEO)
+    t = syd(P2, 0, 1)
+    bob.failBefore = { re: /\/executions$/, count: 1, status: 503, code: 'UNAVAILABLE' }
+    await tick()
+    t += RETRY_AFTER_MS
+    const ctx = { db, fencingToken: 1, now: new Date(t), log: log as never, stillLeader: async () => true }
+    await Promise.all([job().run(ctx), job().run(ctx), job().run(ctx)])
+    expect(execCalls()).toHaveLength(2)
+    expect(funding()).toHaveLength(1)
+  })
+
+  it('RV13-4: a late Linked decision gives the on-time answer: a chore approved during the outage still skips its week', async () => {
+    await setUp(MIA, 'LINKED')
+    t = syd('2026-11-11')
+    const x = api()
+    const c = (await x.gql(bob.signIn(SARAH), `mutation($c: ID!, $key: ID!) { createJob(childId: $c, kind: HOME_JOB, title: "Make the bed", idempotencyKey: $key) { jobId version } }`, { c: MIA, key: K('job-rv4-create') })).body.data!.createJob as { jobId: string; version: number }
+    const s = (await x.gql(bob.signIn(MIA), `mutation($j: ID!, $v: Int!, $key: ID!) { submitJob(jobId: $j, expectedVersion: $v, idempotencyKey: $key) { version } }`, { j: c.jobId, v: c.version, key: K('job-rv4-submit') })).body.data!.submitJob as { version: number }
+    t = syd('2026-11-18') // during the outage, after P1's cut-off
+    await x.gql(bob.signIn(SARAH), `mutation($j: ID!, $v: Int!, $key: ID!) { decideJob(jobId: $j, decision: APPROVE, expectedVersion: $v, idempotencyKey: $key) { job { status } } }`, { j: c.jobId, v: s.version, key: K('job-rv4-decide') })
+    await x.app.close()
+    t = syd(P3, 9)
+    await tick()
+    expect((await cycleDocs()).map((d) => [d.periodStart, d.decision, d.reason])).toEqual([
+      [P1, 'SKIP', 'CHORES_NOT_DONE:1/1'],
+      [P2, 'PAY', 'NO_CHORES_ASSIGNED'],
+    ])
+    expect(funding()).toHaveLength(1)
   })
 })

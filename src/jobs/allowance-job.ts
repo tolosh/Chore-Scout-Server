@@ -24,6 +24,10 @@
  *   cycleKey (unique index), a sender claims the cycle before its BOB call, and
  *   a retry re-sends the original key only. The lease's `stillLeader` check runs
  *   before each cycle, so a runner that lost the lease stops.
+ * - A PAY cycle still DECIDED is always settled under the rule it was decided
+ *   on: setAllowance refuses a pay change until BOB has answered (review 40015).
+ *   A 201 that keeps not matching is held for an operator after
+ *   MAX_MISMATCH_ATTEMPTS, logged at error level, and never re-sent.
  * - Interruption is safe: a crash after the decision leaves the cycle DECIDED,
  *   and the next tick re-sends the same key once the retry interval has passed.
  *   BOB refusals are recorded FAILED with BOB's code and are not job errors.
@@ -48,6 +52,7 @@ export interface AllowanceTickSummary {
   executed: number
   failed: number
   pending: number
+  held: number
   late: number
   stoppedNotLeader: boolean
 }
@@ -68,7 +73,7 @@ export class AllowanceCycleJob implements ScheduledJob {
     const now = ctx.now
     // The week that contains `now` hasn't ended; the one before it is the latest whose cut-off has passed.
     const lastEndedWeek = addDays(weekStartOf(now), -7)
-    const sum: AllowanceTickSummary = { lastEndedWeek, considered: 0, decided: 0, executed: 0, failed: 0, pending: 0, late: 0, stoppedNotLeader: false }
+    const sum: AllowanceTickSummary = { lastEndedWeek, considered: 0, decided: 0, executed: 0, failed: 0, pending: 0, held: 0, late: 0, stoppedNotLeader: false }
     const errors: string[] = []
     const rules = await this.db
       .collection<AllowanceRuleDoc>(RULES)
@@ -86,7 +91,7 @@ export class AllowanceCycleJob implements ScheduledJob {
         (
           await this.db
             .collection<AllowanceCycleDoc>(CYCLES)
-            .find({ cycleKey: { $in: periods.map((p) => cycleKeyOf(rule.childCustomerId, p)) } }, { projection: { _id: 0, periodStart: 1, decision: 1, status: 1, updatedAt: 1 } })
+            .find({ cycleKey: { $in: periods.map((p) => cycleKeyOf(rule.childCustomerId, p)) } }, { projection: { _id: 0, periodStart: 1, decision: 1, status: 1, updatedAt: 1, operatorHold: 1 } })
             .toArray()
         ).map((c) => [c.periodStart, c]),
       )
@@ -94,6 +99,8 @@ export class AllowanceCycleJob implements ScheduledJob {
         const seen = known.get(p)
         // Final records (SKIP, EXECUTED, FAILED) are never re-run. A PAY still DECIDED is retried with its original key.
         if (seen && !(seen.decision === 'PAY' && seen.status === 'DECIDED')) continue
+        // Held for an operator (repeated mismatch): never re-sent automatically; alerted when the hold was set.
+        if (seen?.operatorHold) continue
         if (seen && now.getTime() - seen.updatedAt.getTime() < RETRY_AFTER_MS) continue
         if (!(await ctx.stillLeader())) {
           sum.stoppedNotLeader = true
@@ -118,7 +125,7 @@ export class AllowanceCycleJob implements ScheduledJob {
               ctx.log.warn({ job: this.name, cycleKey, periodStart: p, lastEndedWeek }, 'allowance cycle decided late (missed run caught up)')
             }
           }
-          const fields = { job: this.name, cycleKey, decision: c.decision, reason: c.reason, status: c.status, bobReason: c.bobReason, amountCents: c.amountCents, bobOperationRef: c.bobOperationRef, correlation }
+          const fields = { job: this.name, cycleKey, decision: c.decision, reason: c.reason, status: c.status, bobReason: c.bobReason, operatorHold: c.operatorHold ?? null, amountCents: c.amountCents, bobOperationRef: c.bobOperationRef, correlation }
           if (c.status === 'EXECUTED') {
             sum.executed++
             ctx.log.info(fields, 'allowance cycle executed')
@@ -126,6 +133,9 @@ export class AllowanceCycleJob implements ScheduledJob {
             // An expected BOB refusal (revoked, amount not authorised, ...): recorded, not retried, not a job error.
             sum.failed++
             ctx.log.info(fields, 'allowance cycle refused by BOB; recorded FAILED')
+          } else if (c.operatorHold) {
+            sum.held++
+            ctx.log.error(fields, 'allowance cycle held for an operator: BOB answered with something other than what was asked; not re-sent')
           } else if (c.decision === 'PAY') {
             sum.pending++
             ctx.log.warn(fields, 'allowance payment outcome unknown; will re-send the same key')

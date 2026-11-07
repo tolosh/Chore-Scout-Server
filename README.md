@@ -71,7 +71,10 @@ The jobs process runs one scheduled job, `allowance-cycles`, as the holder of th
 - takes every cycle of the credential's bank whose cut-off has passed and that has no final record, from the rule's first effective period onwards, and runs it through `AllowanceCycleService`: one recorded decision per cycle key, and on PAY one BOB execution (bob-family/1 §7.5) with key `cs:<cycleKey>:allowance` for exactly the rule's amount;
 - never decides a week before its cut-off, never creates a cycle before the rule's start date or its `effectiveFrom`, and pays a cycle missed during an outage once, at its own amount, logging it as late;
 - claims a cycle before its BOB call, so two runners never send the same instruction at once, and checks it still holds the lease before each cycle;
-- re-sends an unknown outcome with the original key only, no sooner than a minute after the last attempt; records BOB's refusals (revoked authority, amount not authorised, ...) as FAILED, without retrying them.
+- re-sends an unknown outcome with the original key only, no sooner than a minute after the last attempt; records BOB's refusals (revoked authority, amount not authorised, ...) as FAILED, without retrying them;
+- holds a cycle for an operator after repeated answers that don't match what was asked: audited, logged at error level, and not re-sent.
+
+While a decided payment is unsettled, `setAllowance` refuses a change to the mode, amount, split or source account (NOT_ALLOWED_IN_STATE), so the payment always settles under the rule it was decided on.
 
 Deploying the jobs process as its own ECS service is separate work.
 

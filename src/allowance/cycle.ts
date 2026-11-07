@@ -14,6 +14,9 @@
  *   cycle, insufficient funds, not found, forbidden) are FAILED with BOB's code.
  *   An unknown outcome or an idempotency 409 stays DECIDED; re-running the cycle
  *   re-sends the same key.
+ * - A 201 that doesn't match is re-sent with the same key at most
+ *   MAX_MISMATCH_ATTEMPTS times, each audited; then the cycle is held for an
+ *   operator (operatorHold) and never re-sent automatically.
  * - One sender at a time: a PAY cycle is claimed (SEND_CLAIM_MS) with a
  *   conditional update before its BOB call, so concurrent runs never send twice.
  * - The Give share's sweep or hold (§6.2) keeps the child's charity choice in
@@ -35,6 +38,12 @@ export const CYCLES = 'allowance_cycles'
  * sender lapses, and the retry re-sends the same key.
  */
 export const SEND_CLAIM_MS = 60_000
+/**
+ * A 201 that doesn't match what was asked is re-sent (same key) at most this many
+ * times. Then the cycle is held for an operator: audited, logged at error level,
+ * and never re-sent automatically (review 40015, optional 4). BOB may have paid.
+ */
+export const MAX_MISMATCH_ATTEMPTS = 3
 const FAILED_CODES = new Set(['AUTHORITY_REVOKED', 'AMOUNT_NOT_AUTHORISED', 'CHILD_NOT_COVERED', 'INVALID_CYCLE', 'INSUFFICIENT_FUNDS', 'NOT_FOUND', 'FORBIDDEN'])
 
 export interface AllowanceCycleDoc {
@@ -53,6 +62,10 @@ export interface AllowanceCycleDoc {
   bobReason: string | null
   bobOperationRef: string | null
   attempts: number
+  /** UPSTREAM_MISMATCH answers so far; at MAX_MISMATCH_ATTEMPTS the cycle is held for an operator. */
+  mismatches?: number
+  /** Set when the cycle needs an operator: it stays DECIDED and is never re-sent automatically. */
+  operatorHold?: string | null
   /** While set and in the future, one sender has the BOB call in flight. */
   claimUntil?: Date | null
   decidedAt: Date
@@ -114,14 +127,14 @@ export class AllowanceCycleService {
       }
       cycle = (await this.cycles.findOne({ cycleKey }, { projection: { _id: 0 } }))!
     }
-    if (cycle.decision === 'PAY' && cycle.status === 'DECIDED') cycle = await this.execute(cycle, correlation)
+    if (cycle.decision === 'PAY' && cycle.status === 'DECIDED' && !cycle.operatorHold) cycle = await this.execute(cycle, correlation)
     return { outcome: 'RECORDED', cycle }
   }
 
   private async execute(c: AllowanceCycleDoc, correlation: string): Promise<AllowanceCycleDoc> {
     const at = this.now()
     const claim = await this.cycles.updateOne(
-      { cycleKey: c.cycleKey, status: 'DECIDED', decision: 'PAY', $or: [{ claimUntil: null }, { claimUntil: { $lte: at } }] },
+      { cycleKey: c.cycleKey, status: 'DECIDED', decision: 'PAY', operatorHold: null, $or: [{ claimUntil: null }, { claimUntil: { $lte: at } }] },
       { $set: { claimUntil: new Date(at.getTime() + SEND_CLAIM_MS) } },
     )
     // Another sender has this cycle's instruction in flight: send nothing; its outcome is recorded by that sender.
@@ -149,7 +162,21 @@ export class AllowanceCycleService {
         giveOk
       if (!matches) {
         // Outside the contract: never shown as paid on an answer that doesn't match what was asked.
-        await this.cycles.updateOne(decided, { $set: { bobReason: 'UPSTREAM_MISMATCH', claimUntil: null, updatedAt: now }, $inc: { attempts: 1 } })
+        const m = (c.mismatches ?? 0) + 1
+        const hold = m >= MAX_MISMATCH_ATTEMPTS ? 'UPSTREAM_MISMATCH' : null
+        await this.cycles.updateOne(decided, { $set: { bobReason: 'UPSTREAM_MISMATCH', operatorHold: hold, claimUntil: null, updatedAt: now }, $inc: { attempts: 1, mismatches: 1 } })
+        await audit(
+          this.db,
+          {
+            actor: 'allowance-cycle',
+            tenantId: c.tenantId,
+            action: hold ? 'allowance.cycle_operator_hold' : 'allowance.cycle_mismatch',
+            subject: c.cycleKey,
+            after: { mismatches: m, asked: { amountCents: c.amountCents, splitCents: c.splitCents }, got: { executionId: e.executionId, amountCents: e.amountCents, legs: e.legs } },
+            correlation,
+          },
+          now,
+        )
       } else {
         final = (await this.cycles.updateOne(decided, { $set: { status: 'EXECUTED', bobOperationRef: e.executionId, bobReason: null, claimUntil: null, updatedAt: now }, $inc: { attempts: 1 } })).modifiedCount === 1
         if (final && e.giveOutcome?.status === 'held') await markUnavailable(this.db, c.childCustomerId, now)
