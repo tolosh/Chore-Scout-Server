@@ -148,6 +148,11 @@ describe('set-up: Guardian only, versioned, idempotent, audited; BOB authority u
     expect(codeOf((await set(x, sarah, K('al-bad-00006'), { s: '2026-11-02' })).body)).toBe('INVALID')
     expect(codeOf((await set(x, sarah, K('al-bad-00007'), { f: null })).body)).toBe('INVALID')
     expect(codeOf((await set(x, sarah, K('al-bad-00008'), { tz: 'Mars/Olympus' })).body)).toBe('INVALID')
+    // D55: the week is Monday 00:00 to Monday 00:00 Australia/Sydney; the Guardian doesn't choose it.
+    expect(codeOf((await set(x, sarah, K('al-bad-00011'), { tz: 'Europe/London' })).body)).toBe('INVALID')
+    expect(codeOf((await set(x, sarah, K('al-bad-00012'), { tz: 'Australia/Melbourne' })).body)).toBe('INVALID')
+    expect(codeOf((await set(x, sarah, K('al-bad-00013'), { s: '2026-11-11' })).body)).toBe('INVALID')
+    expect(codeOf((await set(x, sarah, K('al-bad-00014'), { s: '2026-11-15' })).body)).toBe('INVALID')
     expect(codeOf((await set(x, sarah, K('al-bad-00009'), { c: OTHER_KID })).body)).toBe('FORBIDDEN')
     expect(codeOf((await set(x, bob.signIn(LEO), K('al-bad-00010'))).body)).toBe('FORBIDDEN')
     expect(authorityCalls()).toHaveLength(0)
@@ -266,6 +271,45 @@ describe('T2: Linked (Mia)', () => {
     expect(r).toMatchObject({ outcome: 'RECORDED', cycle: { decision: 'SKIP', reason: 'CHORES_NOT_DONE:1/2', status: 'DECIDED', amountCents: null } })
     expect(execCalls()).toHaveLength(1)
     expect(legs('allowance_funding')).toHaveLength(1)
+    await x.app.close()
+  })
+})
+
+describe('D55 and D56: the Linked week ends Monday 00:00 Sydney; a week with no chores assigned pays', () => {
+  it('D56: Mia, Linked, no chore assigned in the week: PAY the set amount once', async () => {
+    const x = api()
+    await set(x, bob.signIn(SARAH), K('al-d56-00001'), { c: MIA, m: 'LINKED', lc: 'WEEK_CHORES_DONE' })
+    t = syd(P2, 0) + 60_000 // Monday 00:01 Sydney, just after the cut-off
+    const r = await cycles().run(MIA, P1, 'c')
+    expect(r).toMatchObject({ outcome: 'RECORDED', cycle: { decision: 'PAY', reason: 'NO_CHORES_ASSIGNED', status: 'EXECUTED', amountCents: 1000 } })
+    expect(execCalls()).toHaveLength(1)
+    expect(legs('allowance_funding').map((l) => l.amountCents)).toEqual([1000])
+    await x.app.close()
+  })
+
+  it('a chore approved after the Monday 00:00 Sydney cut-off is not done in time: SKIP, zero BOB calls', async () => {
+    const x = api()
+    await set(x, bob.signIn(SARAH), K('al-d55-00001'), { c: MIA, m: 'LINKED', lc: 'WEEK_CHORES_DONE' })
+    t = syd('2026-11-11')
+    const sarah = bob.signIn(SARAH)
+    const c = (await x.gql(sarah, `mutation($c: ID!, $key: ID!) { createJob(childId: $c, kind: HOME_JOB, title: "Make the bed", idempotencyKey: $key) { jobId version } }`, { c: MIA, key: K('al-d55-create') })).body.data!.createJob as { jobId: string; version: number }
+    const sub = (await x.gql(bob.signIn(MIA), `mutation($j: ID!, $v: Int!, $key: ID!) { submitJob(jobId: $j, expectedVersion: $v, idempotencyKey: $key) { version } }`, { j: c.jobId, v: c.version, key: K('al-d55-submit') })).body.data!.submitJob as { version: number }
+    t = syd(P2, 0) + 5 * 60_000 // approved Monday 00:05 Sydney, after the week ended
+    await x.gql(bob.signIn(SARAH), `mutation($j: ID!, $v: Int!, $key: ID!) { decideJob(jobId: $j, decision: APPROVE, expectedVersion: $v, idempotencyKey: $key) { job { status } } }`, { j: c.jobId, v: sub.version, key: K('al-d55-decide') })
+    expect(await cycles().run(MIA, P1, 'c')).toMatchObject({ outcome: 'RECORDED', cycle: { decision: 'SKIP', reason: 'CHORES_NOT_DONE:1/1', status: 'DECIDED' } })
+    expect(execCalls()).toHaveLength(0)
+    await x.app.close()
+  })
+
+  it('a 201 that does not match what was asked is never shown as paid', async () => {
+    const x = api()
+    await set(x, bob.signIn(SARAH), K('al-mism-0001'))
+    t = syd(P2, 9)
+    bob.mutateFamily = (d) => {
+      if ('execution_id' in d) d.amount_cents = 1100
+    }
+    expect(await cycles().run(LEO, P1, 'c')).toMatchObject({ cycle: { status: 'DECIDED', bobReason: 'UPSTREAM_MISMATCH' } })
+    bob.mutateFamily = null
     await x.app.close()
   })
 })

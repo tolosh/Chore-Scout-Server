@@ -1,6 +1,6 @@
 /** CS-3963: the per-cycle decision in isolation. Pure and deterministic; no database, no BOB. */
 import { describe, expect, it } from 'vitest'
-import { addDays, decideCycle, isDate, isTimezone, localDate, periodContaining, type ChoreState, type DecisionRule } from '../src/allowance/decide.js'
+import { addDays, decideCycle, isDate, isTimezone, isWeekStart, localDate, periodContaining, weekStartOf, type ChoreState, type DecisionRule } from '../src/allowance/decide.js'
 import { splitCentsOf } from '../src/allowance/rule.js'
 
 const TZ = 'Australia/Sydney'
@@ -49,13 +49,44 @@ describe('modes', () => {
     expect(decideCycle(linked, '2026-11-09', now, [chore('2026-11-11', 'SENT_BACK', '2026-11-12')])).toMatchObject({ decision: 'SKIP', reason: 'CHORES_NOT_DONE:1/1' })
     expect(decideCycle(linked, '2026-11-09', syd('2026-11-20'), [chore('2026-11-11', 'DONE', '2026-11-17')])).toMatchObject({ decision: 'SKIP', reason: 'CHORES_NOT_DONE:1/1' })
   })
-  it('LINKED with no chore assigned in the week skips (the condition is never assumed met)', () => {
-    expect(decideCycle(linked, '2026-11-09', now, [chore('2026-11-02', 'DONE', '2026-11-03'), chore('2026-11-16', 'DONE', '2026-11-16')])).toMatchObject({ decision: 'SKIP', reason: 'NO_CHORES_ASSIGNED' })
-    expect(decideCycle(linked, '2026-11-09', now, [{ ...chore('2026-11-10', 'TODO', null), kind: 'EXTRA_EARNER' }])).toMatchObject({ decision: 'SKIP', reason: 'NO_CHORES_ASSIGNED' })
+  it('D56: LINKED with no chore assigned in the week pays (nothing was missed)', () => {
+    expect(decideCycle(linked, '2026-11-09', now, [])).toEqual({ kind: 'DECIDED', decision: 'PAY', reason: 'NO_CHORES_ASSIGNED', amountCents: 1000, ruleVersion: 3 })
+    // Chores in other weeks, and kinds other than HOME_JOB, are not this week's assigned chores.
+    expect(decideCycle(linked, '2026-11-09', now, [chore('2026-11-02', 'WAITING', null), chore('2026-11-16', 'TODO', null)])).toMatchObject({ decision: 'PAY', reason: 'NO_CHORES_ASSIGNED', amountCents: 1000 })
+    expect(decideCycle(linked, '2026-11-09', now, [{ ...chore('2026-11-10', 'TODO', null), kind: 'EXTRA_EARNER' }])).toMatchObject({ decision: 'PAY', reason: 'NO_CHORES_ASSIGNED' })
+    // Still never early.
+    expect(decideCycle(linked, '2026-11-09', syd('2026-11-15', 23), [])).toMatchObject({ kind: 'NOT_DUE' })
   })
   it('is deterministic: the same inputs give the same answer', () => {
     const c = [chore('2026-11-10', 'DONE', '2026-11-11')]
     expect(decideCycle(linked, '2026-11-09', now, c)).toEqual(decideCycle(linked, '2026-11-09', now, c))
+  })
+})
+
+describe('D55: one product week, Monday 00:00 to Monday 00:00 Australia/Sydney', () => {
+  it('a rule on another timezone or start day is never decided', () => {
+    const now = syd('2026-12-31')
+    expect(decideCycle(rule({ timezone: 'Europe/London' }), '2026-11-09', now, [])).toEqual({ kind: 'INVALID_PERIOD', reason: 'NOT_PRODUCT_WEEK' })
+    expect(decideCycle(rule({ startDate: '2026-11-11', effectiveFrom: '2026-11-11' }), '2026-11-18', now, [])).toEqual({ kind: 'INVALID_PERIOD', reason: 'NOT_PRODUCT_WEEK' })
+  })
+
+  it('the Linked cut-off is the end of the week: Monday 00:00 Sydney, across the October DST change', () => {
+    // Sydney moves to UTC+11 on 2026-10-04. The week of 2026-09-28 ends 2026-10-05 00:00 AEDT = 2026-10-04T13:00Z.
+    const r = rule({ mode: 'LINKED', linkedCondition: 'WEEK_CHORES_DONE', startDate: '2026-09-28', effectiveFrom: '2026-09-28' })
+    const c = [{ kind: 'HOME_JOB', status: 'DONE', createdAt: new Date('2026-09-29T00:00:00Z'), decidedAt: new Date('2026-10-04T12:59:00Z') }]
+    expect(decideCycle(r, '2026-09-28', new Date('2026-10-04T12:59:59Z'), c)).toMatchObject({ kind: 'NOT_DUE', cutOff: '2026-10-05' })
+    expect(decideCycle(r, '2026-09-28', new Date('2026-10-04T13:00:00Z'), c)).toMatchObject({ decision: 'PAY' })
+    const late = [{ ...c[0]!, decidedAt: new Date('2026-10-04T13:00:00Z') }]
+    expect(decideCycle(r, '2026-09-28', new Date('2026-10-04T13:00:00Z'), late)).toMatchObject({ decision: 'SKIP', reason: 'CHORES_NOT_DONE:1/1' })
+  })
+
+  it('week starts', () => {
+    expect(isWeekStart('2026-11-09')).toBe(true)
+    expect(isWeekStart('2026-11-11')).toBe(false)
+    expect(isWeekStart('2026-11-08')).toBe(false)
+    expect(weekStartOf(new Date('2026-11-08T12:59:59Z'))).toBe('2026-11-02') // Sunday 23:59:59 Sydney
+    expect(weekStartOf(new Date('2026-11-08T13:00:00Z'))).toBe('2026-11-09') // Monday 00:00 Sydney
+    expect(weekStartOf(new Date('2026-11-15T12:00:00Z'))).toBe('2026-11-09')
   })
 })
 

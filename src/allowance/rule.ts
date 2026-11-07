@@ -10,6 +10,9 @@
  *   rule's amount always equals BOB's authorised amount.
  * - A mode or amount change applies from the period in which it is made
  *   (`effectiveFrom`); undecided earlier periods are never paid (no backfill).
+ * - D55: the week is Monday 00:00 to Monday 00:00 Australia/Sydney for every
+ *   child. Any other timezone, or a startDate that isn't a Monday, is refused
+ *   (INVALID) before BOB is called.
  * - The cycle (cadence, startDate, timezone) can't change in S0: BOB's cycle is
  *   fixed on the authority (§7.2), so it needs a revoke and a new authority.
  * DocumentDB: no upserts and no transactions; insertOne (E11000 = stale) and
@@ -23,7 +26,7 @@ import { forbidden, invalid, notAllowedInState, stale, unauthenticated, upstream
 import { assertGuardianOf } from '../identity/authz.js'
 import type { Actor } from '../identity/principal.js'
 import { toCents, type MoneyInput } from '../money.js'
-import { isDate, isTimezone, localDate, periodContaining, type AllowanceMode } from './decide.js'
+import { isDate, isTimezone, isWeekStart, localDate, periodContaining, PRODUCT_TIMEZONE, type AllowanceMode } from './decide.js'
 
 export const RULES = 'allowance_rules'
 const KEY_RE = /^[A-Za-z0-9._:-]{8,128}$/
@@ -104,6 +107,9 @@ export class AllowanceRuleService {
     if (i.cadence !== 'WEEKLY') throw invalid('cadence must be WEEKLY in S0')
     if (!isDate(i.startDate)) throw invalid('startDate must be a date, YYYY-MM-DD')
     if (!isTimezone(i.timezone)) throw invalid('timezone must be an IANA timezone')
+    // D55: one product week, Monday 00:00 to Monday 00:00 Australia/Sydney. The Guardian doesn't choose it.
+    if (i.timezone !== PRODUCT_TIMEZONE) throw invalid(`timezone must be ${PRODUCT_TIMEZONE}: every allowance week is the product week (D55)`)
+    if (!isWeekStart(i.startDate)) throw invalid('startDate must be a Monday: every allowance week starts Monday 00:00 Australia/Sydney (D55)')
     const s = i.defaultSplit
     if (![s.spendPercent, s.savePercent, s.givePercent].every(pct) || s.spendPercent + s.savePercent + s.givePercent !== 100) throw invalid('defaultSplit must be whole percentages adding up to 100')
     const linkedCondition = i.linkedCondition ?? null
