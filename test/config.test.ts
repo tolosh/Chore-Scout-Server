@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { ConfigError, forbiddenCredentialKeys, loadConfig } from '../src/config.js'
+import { readFileSync } from 'node:fs'
+import { clockOverrideKeys, ConfigError, forbiddenCredentialKeys, loadConfig } from '../src/config.js'
 import { mongoClientOptions } from '../src/db.js'
 import { baseEnv } from './helpers/mongo.js'
 
@@ -37,14 +38,31 @@ describe('config: fail closed (T4)', () => {
     expect(p.join(' ')).not.toContain('hunter2')
   })
 
-  it('jobs process requires the scoped BOB allowance credential slot', () => {
-    expect(problemsOf(() => loadConfig('jobs', baseEnv()))).toContain('BOB_ALLOWANCE_CREDENTIAL is required')
-    const cfg = loadConfig('jobs', { ...baseEnv(), BOB_ALLOWANCE_CREDENTIAL: 'x'.repeat(32) })
+  const jobsEnv = () => ({ ...baseEnv(), BOB_ALLOWANCE_CREDENTIAL: 'x'.repeat(32), BOB_API_URL: 'http://bob.internal', ALLOWANCE_TENANT_ID: 'bank_bilgola' })
+
+  it('jobs process requires the scoped BOB allowance credential slot, BOB_API_URL and the credential’s bank', () => {
+    const p = problemsOf(() => loadConfig('jobs', baseEnv()))
+    expect(p).toContain('BOB_ALLOWANCE_CREDENTIAL is required')
+    expect(p).toContain('ALLOWANCE_TENANT_ID is required')
+    expect(p.join()).toMatch(/BOB_API_URL is required in the jobs process/)
+    expect(problemsOf(() => loadConfig('jobs', { ...jobsEnv(), ALLOWANCE_TENANT_ID: 'bank_nowhere' })).join()).toMatch(/ALLOWANCE_TENANT_ID/)
+    const cfg = loadConfig('jobs', jobsEnv())
     expect(cfg.JOB_LEASE_TTL_MS).toBe(30_000)
+    expect(cfg.ALLOWANCE_TENANT_ID).toBe('bank_bilgola')
+  })
+
+  it('T8 (CS-3979): real clock only; any clock-override key refuses start-up in every process', () => {
+    for (const key of ['CS_TEST_CLOCK', 'CLOCK_OFFSET_MS', 'FAKE_TIME', 'TIME_TRAVEL', 'NOW_OVERRIDE', 'JOB_TIME_OFFSET']) {
+      for (const role of ['api', 'jobs', 'migrate'] as const) expect(problemsOf(() => loadConfig(role, { ...jobsEnv(), BOB_ALLOWANCE_CREDENTIAL: role === 'jobs' ? 'x'.repeat(32) : '', [key]: '1' })).join(), `${role} ${key}`).toMatch(/clock override/)
+    }
+    // The shipped example configuration has no such key either.
+    const example = readFileSync(new URL('../.env.example', import.meta.url), 'utf8')
+    const keys = Object.fromEntries(example.split('\n').filter((l) => /^[A-Z_]+=/.test(l)).map((l) => [l.split('=')[0]!, 'x']))
+    expect(clockOverrideKeys(keys)).toEqual([])
   })
 
   it('jobs tick must be shorter than the lease TTL', () => {
-    const env = { ...baseEnv(), BOB_ALLOWANCE_CREDENTIAL: 'x'.repeat(32), JOB_TICK_INTERVAL_MS: '30000', JOB_LEASE_TTL_MS: '30000' }
+    const env = { ...jobsEnv(), JOB_TICK_INTERVAL_MS: '30000', JOB_LEASE_TTL_MS: '30000' }
     expect(problemsOf(() => loadConfig('jobs', env)).join()).toMatch(/JOB_TICK_INTERVAL_MS/)
   })
 
