@@ -317,4 +317,47 @@ describe('D51: the server’s charity follows what BOB sweeps to', () => {
     expect(drift[0]).toMatchObject({ subject: LEO, after: { bobCharityId: TREES, revision: 1 } })
     await api.app.close()
   })
+
+  it('a switch whose answer is lost after BOB recorded it: the pending choice is shown, and the next sweep settles it', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-d51-sw1') })
+    bob.dropResponses = { re: /give-recipient$/, count: 1 }
+    expect(codeOf((await api.gql(leo, SET, { c: LEO, id: TREES, v: 1, key: K('pref-d51-sw2') })).body)).toBe('UPSTREAM_UNAVAILABLE')
+    expect(bob.recipients.get(LEO)!.charityId).toBe(TREES) // BOB recorded it; only the answer was lost
+    expect(await g2(api, leo)).toEqual({ availability: 'AVAILABLE', confirmingBobCharityId: TREES, preference: { bobCharityId: PAWS, availability: 'AVAILABLE' } })
+    expect((await payAndSplit(api, '0.40', 55)).status).toBe('DONATED')
+    expect(bob.balance(TREES, 'spend')).toBe(40)
+    expect(bob.balance(PAWS, 'spend')).toBe(0)
+    expect(await g2(api, leo)).toEqual({ availability: 'AVAILABLE', confirmingBobCharityId: null, preference: { bobCharityId: TREES, availability: 'AVAILABLE' } })
+    expect(await auditOf('giving.preference_confirmed_by_sweep')).toHaveLength(1)
+    expect(await auditOf('giving.recipient_drift')).toHaveLength(0)
+    await api.app.close()
+  })
+
+  it('a 200 with eligible:false is shown UNAVAILABLE, never AVAILABLE', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    bob.mutateFamily = (d) => {
+      if ('eligible' in d) d.eligible = false
+    }
+    const r = await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-elig-01') })
+    expect(r.body.data!.setCharityPreference).toMatchObject({ bobCharityId: PAWS, version: 1, availability: 'UNAVAILABLE' })
+    bob.mutateFamily = null
+    expect(await g2(api, leo)).toEqual({ availability: 'UNAVAILABLE', confirmingBobCharityId: null, preference: { bobCharityId: PAWS, availability: 'UNAVAILABLE' } })
+    await api.app.close()
+  })
+
+  it('a 200 naming a different charity_id is unknown: UPSTREAM_UNAVAILABLE, and the choice stays pending', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    bob.mutateFamily = (d) => {
+      if ('eligible' in d) d.charity_id = TREES
+    }
+    expect(codeOf((await api.gql(leo, SET, { c: LEO, id: PAWS, key: K('pref-mism-01') })).body)).toBe('UPSTREAM_UNAVAILABLE')
+    bob.mutateFamily = null
+    expect(await g2(api, leo)).toEqual({ availability: 'NONE_SELECTED', confirmingBobCharityId: PAWS, preference: null })
+    expect(await auditOf('giving.preference_confirmed')).toHaveLength(0)
+    await api.app.close()
+  })
 })
