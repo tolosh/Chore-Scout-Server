@@ -276,6 +276,50 @@ describe('T4: a change after the review refuses the confirmation and needs a new
   })
 })
 
+describe('a charity disabled, then re-enabled: the review offered can be confirmed (review 39967 R1)', () => {
+  it('BOB quoting the confirmed charity makes it AVAILABLE again; the child confirms and exactly one release follows', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    await choose(api, leo, PAWS, K('hg-reen-pref'))
+    bob.charities.get(PAWS)!.enabled = false
+    expect(await payAndSplit(api, '0.40', 61)).toBe('HELD')
+    const pref = () => db.collection('charity_preferences').findOne({ childCustomerId: LEO })
+    expect((await pref())!.availability).toBe('UNAVAILABLE')
+    // While BOB still refuses the charity there is nothing to confirm.
+    expect(await held(api, leo)).toMatchObject({ amount: { amount: '0.40' }, recipientUnavailable: true, reviewVersion: 0 })
+    bob.charities.get(PAWS)!.enabled = true
+    const h = (await held(api, leo))!
+    expect(h).toMatchObject({ amount: { amount: '0.40' }, recipientName: 'Paws Rescue', recipientUnavailable: false, reviewVersion: 1 })
+    expect((await pref())!.availability).toBe('AVAILABLE')
+    expect(await db.collection('audit').countDocuments({ action: 'giving.preference_available_by_quote', subject: LEO })).toBe(1)
+    const r = await confirm(api, leo, h.reviewVersion, K('hg-reen-0001'))
+    expect((r.body.data!.confirmHeldRelease as { operation: Op }).operation.status).toBe('COMPLETED')
+    expect(confirmCalls()).toHaveLength(1)
+    expect(releases().map((l) => l.amountCents)).toEqual([40])
+    expect(bob.balance(PAWS, 'spend')).toBe(40)
+    expect(bob.held.get(LEO) ?? 0).toBe(0)
+    // A repeat pays nothing more.
+    await confirm(api, leo, h.reviewVersion, K('hg-reen-0002'))
+    expect(releases()).toHaveLength(1)
+    await api.app.close()
+  })
+
+  it('an open review is not reused once the choice is UNAVAILABLE: the next read asks BOB again', async () => {
+    const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
+    const leo = bob.signIn(LEO)
+    await heldThenPaws(api, leo)
+    expect((await held(api, leo))!.reviewVersion).toBe(1)
+    await db.collection('charity_preferences').updateOne({ childCustomerId: LEO }, { $set: { availability: 'UNAVAILABLE' } })
+    const quotes = quoteCalls().length
+    const h = (await held(api, leo))!
+    expect(quoteCalls()).toHaveLength(quotes + 1)
+    expect(h).toMatchObject({ recipientUnavailable: false, reviewVersion: 2 })
+    expect(((await confirm(api, leo, 2, K('hg-reuse-001'))).body.data!.confirmHeldRelease as { operation: Op }).operation.status).toBe('COMPLETED')
+    expect(releases()).toHaveLength(1)
+    await api.app.close()
+  })
+})
+
 describe('T5: an in-flight release keeps its pinned recipient (HOLD-5)', () => {
   it('confirmed to Paws, answer lost, Leo then picks Trees: the retry still pays Paws, once', async () => {
     const api = buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })

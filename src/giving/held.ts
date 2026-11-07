@@ -14,6 +14,10 @@
  * - Anything that changed after the review (amount, recipient, eligibility,
  *   expiry, a newer review) refuses the confirmation with STALE_VERSION and a
  *   new review is needed. Checked here before BOB, and by BOB (FRESH_QUOTE_NEEDED).
+ * - A review is offered only for a charity the server shows AVAILABLE. If the
+ *   choice is UNAVAILABLE (an earlier hold) and BOB now quotes it, BOB has
+ *   resolved it, so it becomes AVAILABLE first (audited); a refused quote keeps
+ *   it UNAVAILABLE with nothing to confirm. Review and confirm always agree.
  * - Choosing a charity, a later cycle, a sweep or a retry never releases held
  *   money (HOLD-2): only this confirm does.
  * DocumentDB: no upserts and no transactions; conditional single-document updates.
@@ -129,7 +133,7 @@ export class HeldGiveService {
     const latest = await this.latest(childId)
     const now = this.now()
     const usable = (r: HeldReviewDoc | null): r is HeldReviewDoc =>
-      !!r && r.tenantId === p.tenantId && r.status === 'OPEN' && r.amountCents === heldCents && r.charityId === pref?.bobCharityId && r.expiresAt.getTime() - now.getTime() > REUSE_MARGIN_MS
+      !!r && r.tenantId === p.tenantId && r.status === 'OPEN' && r.amountCents === heldCents && r.charityId === pref?.bobCharityId && pref.availability === 'AVAILABLE' && r.expiresAt.getTime() - now.getTime() > REUSE_MARGIN_MS
     const unavailable: HeldView = { childCustomerId: childId, amountCents: heldCents, recipientName: null, recipientUnavailable: true, reviewVersion: 0, confirmedAt: null }
 
     if (!isChild(p)) return usable(latest) ? viewOf(latest) : { ...unavailable, recipientUnavailable: !pref?.bobCharityId || pref.availability !== 'AVAILABLE' }
@@ -146,6 +150,24 @@ export class HeldGiveService {
     if (q.kind === 'refused' && q.code === 'UNAUTHORIZED') throw unauthenticated()
     if (q.kind === 'refused' && q.code === 'FORBIDDEN') throw forbidden()
     if (q.kind !== 'ok') throw upstreamUnavailable('the bank did not quote the held Give')
+
+    // BOB quoted the child's confirmed charity, so BOB has resolved it as eligible
+    // again (e.g. disabled, then re-enabled). Show it AVAILABLE before offering the
+    // review, so review and confirm agree on what can be confirmed (review 39967 R1).
+    if (pref.availability !== 'AVAILABLE') {
+      const back = await this.db
+        .collection<CharityPreferenceDoc>(PREFERENCES)
+        .updateOne({ childCustomerId: childId, tenantId: p.tenantId, bobCharityId: q.value.charityId, availability: { $ne: 'AVAILABLE' } }, { $set: { availability: 'AVAILABLE', updatedAt: now } })
+      if (back.modifiedCount === 1) {
+        await audit(
+          this.db,
+          { actor: p.customerId, tenantId: p.tenantId, action: 'giving.preference_available_by_quote', subject: childId, before: { bobCharityId: pref.bobCharityId, availability: pref.availability }, after: { bobCharityId: q.value.charityId, revision: q.value.revision, availability: 'AVAILABLE' }, correlation: `quote:${q.value.quoteId}` },
+          now,
+        )
+      } else if ((await readPreference(this.db, childId, p.tenantId))?.availability !== 'AVAILABLE') {
+        throw stale('the charity choice changed; review again')
+      }
+    }
 
     // The next review version comes from the preference document's own counter (no upsert; it exists here).
     const bumped = await this.db
