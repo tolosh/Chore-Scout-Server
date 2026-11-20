@@ -162,9 +162,17 @@ export class AllowanceCycleService {
         giveOk
       if (!matches) {
         // Outside the contract: never shown as paid on an answer that doesn't match what was asked.
-        const m = (c.mismatches ?? 0) + 1
+        // The hold is decided from the stored count after this increment, never from the copy read
+        // before the claim, which another sender may have moved on since (review 40045 A1). The claim
+        // stays ours until the hold is decided, so no other sender can send in between.
+        const counted = await this.cycles.findOneAndUpdate(
+          decided,
+          { $set: { bobReason: 'UPSTREAM_MISMATCH', updatedAt: now }, $inc: { attempts: 1, mismatches: 1 } },
+          { returnDocument: 'after', upsert: false, projection: { _id: 0, mismatches: 1 } },
+        )
+        const m = counted?.mismatches ?? (c.mismatches ?? 0) + 1
         const hold = m >= MAX_MISMATCH_ATTEMPTS ? 'UPSTREAM_MISMATCH' : null
-        await this.cycles.updateOne(decided, { $set: { bobReason: 'UPSTREAM_MISMATCH', operatorHold: hold, claimUntil: null, updatedAt: now }, $inc: { attempts: 1, mismatches: 1 } })
+        await this.cycles.updateOne(decided, { $set: { operatorHold: hold, claimUntil: null } })
         await audit(
           this.db,
           {

@@ -29,7 +29,7 @@ import { forbidden, invalid, notAllowedInState, stale, unauthenticated, upstream
 import { assertGuardianOf } from '../identity/authz.js'
 import type { Actor } from '../identity/principal.js'
 import { toCents, type MoneyInput } from '../money.js'
-import { addDays, cycleKeyOf, isDate, isTimezone, isWeekStart, localDate, periodContaining, PRODUCT_TIMEZONE, type AllowanceMode } from './decide.js'
+import { isDate, isTimezone, isWeekStart, localDate, periodContaining, PRODUCT_TIMEZONE, type AllowanceMode } from './decide.js'
 
 export const RULES = 'allowance_rules'
 /** cycle.ts's CYCLES, named here to keep the module graph acyclic (cycle.ts imports this file). */
@@ -208,7 +208,7 @@ export class AllowanceRuleService {
     const changesPay = i.mode !== doc.mode || v.amountCents !== doc.amountCents || v.linkedCondition !== doc.linkedCondition
     // CS-3979 review 40015 R1, R2: a payment already decided but not yet settled with BOB is paid under the
     // rule it was decided on. Refuse any change to what is paid until BOB has answered for it.
-    if (changesAuthority || changesPay) await this.assertNoUnsettledPayment(doc, v.today)
+    if (changesAuthority || changesPay) await this.assertNoUnsettledPayment(doc)
     let authorityVersion = doc.authorityVersion
     if (changesAuthority) {
       // SD-7: BOB first. If BOB refuses, nothing here is saved.
@@ -242,16 +242,17 @@ export class AllowanceRuleService {
 
   /**
    * NOT_ALLOWED_IN_STATE while any PAY cycle of this child is still DECIDED (its BOB
-   * outcome unknown, or held for an operator). Read by cycleKey on its unique index:
-   * every period from the rule's start date to the current one.
+   * outcome unknown, or held for an operator). A Linked SKIP also stays DECIDED and
+   * never blocks a change (review 40045 A2).
+   *
+   * Read on the child_decision_status index (migration 002, review 40045 A4): the
+   * cost is the number of unsettled PAY cycles, not the number of weeks since the
+   * rule started, which the earlier cycleKey $in list grew with.
    */
-  private async assertNoUnsettledPayment(doc: AllowanceRuleDoc, today: string): Promise<void> {
-    const keys: string[] = []
-    const last = periodContaining(doc.startDate, today)
-    for (let p = doc.startDate; p <= last; p = addDays(p, 7)) keys.push(cycleKeyOf(doc.childCustomerId, p))
+  private async assertNoUnsettledPayment(doc: AllowanceRuleDoc): Promise<void> {
     const open = await this.db
-      .collection<{ cycleKey: string; periodStart: string; decision: string; status: string; operatorHold?: string | null }>(CYCLES)
-      .findOne({ cycleKey: { $in: keys }, decision: 'PAY', status: 'DECIDED' }, { projection: { _id: 0, periodStart: 1, operatorHold: 1 } })
+      .collection<{ childCustomerId: string; periodStart: string; decision: string; status: string; operatorHold?: string | null }>(CYCLES)
+      .findOne({ childCustomerId: doc.childCustomerId, decision: 'PAY', status: 'DECIDED' }, { sort: { periodStart: 1 }, projection: { _id: 0, periodStart: 1, operatorHold: 1 } })
     if (open?.operatorHold) {
       throw notAllowedInState(`the allowance payment for the week starting ${open.periodStart} is being checked by support; the allowance can't be changed until that check is done`)
     }

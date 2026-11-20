@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { LeaseLock } from '../src/lease.js'
 import { REGISTERED_JOBS } from '../src/jobs/registry.js'
-import { JobRunner, type ScheduledJob } from '../src/jobs/runner.js'
+import { JobRunner, schedulerLeaseFor, type ScheduledJob } from '../src/jobs/runner.js'
 import { startMongo, type TestMongo } from './helpers/mongo.js'
 
 let mongo: TestMongo
@@ -12,6 +12,7 @@ afterAll(async () => {
   await mongo?.stop()
 })
 
+const L = schedulerLeaseFor('bank_bilgola')
 const silent = { info: () => undefined, warn: () => undefined, error: () => undefined }
 
 describe('lease lock (no upserts; DocumentDB E11000 finding)', () => {
@@ -61,12 +62,12 @@ describe('job runner (single runner)', () => {
     const db = mongo.db()
     const checks: boolean[] = []
     const job: ScheduledJob = { name: 'probe', run: async (ctx) => void checks.push(await ctx.stillLeader()) }
-    await new JobRunner(db, 'leader-a', 1_000, [job], silent, () => t).tick()
+    await new JobRunner(db, L, 'leader-a', 1_000, [job], silent, () => t).tick()
     let later: (() => Promise<boolean>) | null = null
     const slow: ScheduledJob = { name: 'slow', run: async (ctx) => void (later = ctx.stillLeader) }
-    await new JobRunner(db, 'leader-a', 1_000, [slow], silent, () => t).tick()
+    await new JobRunner(db, L, 'leader-a', 1_000, [slow], silent, () => t).tick()
     t = new Date(t.getTime() + 1_001)
-    await new JobRunner(db, 'leader-b', 1_000, [], silent, () => t).tick()
+    await new JobRunner(db, L, 'leader-b', 1_000, [], silent, () => t).tick()
     expect(checks).toEqual([true])
     expect(await later!()).toBe(false)
   })
@@ -75,8 +76,8 @@ describe('job runner (single runner)', () => {
     const db = mongo.db()
     const runs: string[] = []
     const job: ScheduledJob = { name: 'probe', run: async (ctx) => void runs.push(`${ctx.fencingToken}`) }
-    const r1 = new JobRunner(db, 'r1', 30_000, [job], silent)
-    const r2 = new JobRunner(db, 'r2', 30_000, [job], silent)
+    const r1 = new JobRunner(db, L, 'r1', 30_000, [job], silent)
+    const r2 = new JobRunner(db, L, 'r2', 30_000, [job], silent)
     const [t1, t2] = await Promise.all([r1.tick(), r2.tick()])
     expect([t1.leader, t2.leader].filter(Boolean)).toHaveLength(1)
     expect(runs).toEqual(['1'])
@@ -86,7 +87,7 @@ describe('job runner (single runner)', () => {
     const db = mongo.db()
     const bad: ScheduledJob = { name: 'bad', run: async () => Promise.reject(new Error('boom')) }
     const good: ScheduledJob = { name: 'good', run: async () => undefined }
-    const res = await new JobRunner(db, 'r', 30_000, [bad, good], silent).tick()
+    const res = await new JobRunner(db, L, 'r', 30_000, [bad, good], silent).tick()
     expect(res).toEqual({ leader: true, ran: ['good'], failed: ['bad'] })
   })
 })

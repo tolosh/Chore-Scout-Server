@@ -39,6 +39,7 @@ import type { Db } from 'mongodb'
 import { AllowanceCycleService, CYCLES, type AllowanceCycleDoc } from '../allowance/cycle.js'
 import { addDays, cycleKeyOf, weekStartOf } from '../allowance/decide.js'
 import { RULES, type AllowanceRuleDoc } from '../allowance/rule.js'
+import { ALERT, ALLOWANCE_TICK_EVENT, EXPECTED_FAILED_REASONS } from './alerts.js'
 import type { JobContext, ScheduledJob } from './runner.js'
 
 export const ALLOWANCE_JOB = 'allowance-cycles'
@@ -104,7 +105,7 @@ export class AllowanceCycleJob implements ScheduledJob {
         if (seen && now.getTime() - seen.updatedAt.getTime() < RETRY_AFTER_MS) continue
         if (!(await ctx.stillLeader())) {
           sum.stoppedNotLeader = true
-          ctx.log.warn({ job: this.name }, 'scheduler lease lost; stopping before the next cycle')
+          ctx.log.warn({ job: this.name, tenantId: this.tenantId, alert: ALERT.LEASE_LOST }, 'scheduler lease lost; stopping before the next cycle')
           break outer
         }
         sum.considered++
@@ -122,20 +123,21 @@ export class AllowanceCycleJob implements ScheduledJob {
             // A week before the latest ended one is a catch-up: a run was missed (outage). Visible as a warning.
             if (p < lastEndedWeek) {
               sum.late++
-              ctx.log.warn({ job: this.name, cycleKey, periodStart: p, lastEndedWeek }, 'allowance cycle decided late (missed run caught up)')
+              ctx.log.warn({ job: this.name, tenantId: this.tenantId, cycleKey, periodStart: p, lastEndedWeek, alert: ALERT.MISSED_RUN }, 'allowance cycle decided late (missed run caught up)')
             }
           }
-          const fields = { job: this.name, cycleKey, decision: c.decision, reason: c.reason, status: c.status, bobReason: c.bobReason, operatorHold: c.operatorHold ?? null, amountCents: c.amountCents, bobOperationRef: c.bobOperationRef, correlation }
+          const fields = { job: this.name, tenantId: this.tenantId, cycleKey, decision: c.decision, reason: c.reason, status: c.status, bobReason: c.bobReason, operatorHold: c.operatorHold ?? null, amountCents: c.amountCents, bobOperationRef: c.bobOperationRef, correlation }
           if (c.status === 'EXECUTED') {
             sum.executed++
             ctx.log.info(fields, 'allowance cycle executed')
           } else if (c.status === 'FAILED') {
             // An expected BOB refusal (revoked, amount not authorised, ...): recorded, not retried, not a job error.
             sum.failed++
-            ctx.log.info(fields, 'allowance cycle refused by BOB; recorded FAILED')
+            if (c.bobReason !== null && EXPECTED_FAILED_REASONS.has(c.bobReason)) ctx.log.info(fields, 'allowance cycle refused by BOB; recorded FAILED')
+            else ctx.log.warn({ ...fields, alert: ALERT.UNEXPECTED_FAILED }, 'allowance cycle refused by BOB; recorded FAILED')
           } else if (c.operatorHold) {
             sum.held++
-            ctx.log.error(fields, 'allowance cycle held for an operator: BOB answered with something other than what was asked; not re-sent')
+            ctx.log.error({ ...fields, alert: ALERT.OPERATOR_HOLD }, 'allowance cycle held for an operator: BOB answered with something other than what was asked; not re-sent')
           } else if (c.decision === 'PAY') {
             sum.pending++
             ctx.log.warn(fields, 'allowance payment outcome unknown; will re-send the same key')
@@ -144,12 +146,12 @@ export class AllowanceCycleJob implements ScheduledJob {
           }
         } catch (err) {
           errors.push(`${cycleKey}: ${(err as Error).message}`)
-          ctx.log.error({ job: this.name, cycleKey, err: (err as Error).message }, 'allowance cycle errored; will retry next tick')
+          ctx.log.error({ job: this.name, tenantId: this.tenantId, cycleKey, err: (err as Error).message, alert: ALERT.CYCLE_ERROR }, 'allowance cycle errored; will retry next tick')
         }
       }
     }
     this.last = sum
-    ctx.log.info({ job: this.name, ...sum }, 'allowance tick complete')
+    ctx.log.info({ job: this.name, tenantId: this.tenantId, event: ALLOWANCE_TICK_EVENT, ...sum }, 'allowance tick complete')
     if (errors.length > 0) throw new Error(`${errors.length} allowance cycle(s) errored`)
   }
 }
