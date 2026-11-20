@@ -13,11 +13,13 @@
  *   in the environment or secrets refuses start-up, except BOB_API_URL, which
  *   is an address, not a credential, and is refused if it carries one
  *   (userinfo, a query string or a fragment).
+ * - Real clock only: any clock-override key refuses start-up (CS-3979 T8).
  * - The server reaches BOB only with the person's own forwarded session
  *   (CS-3942; contract bob-session/1 §3). Without BOB_API_URL the API still
  *   starts, but every request is refused (UPSTREAM_UNAVAILABLE).
  */
 import { z } from 'zod'
+import { KNOWN_BANKS } from './bob/session-check.js'
 
 export type Role = 'api' | 'jobs' | 'migrate'
 
@@ -105,6 +107,9 @@ const jobsExtra = z.object({
   // Secrets-store slot for the one scoped BOB credential (CS-3941 comment, spec §3.7).
   // It can only invoke Guardian standing authorities for allowance payments; BOB limits it.
   BOB_ALLOWANCE_CREDENTIAL: z.string().min(16, 'BOB_ALLOWANCE_CREDENTIAL must be set (from the secrets store)'),
+  // The bank (tenant) the allowance credential belongs to: BOB issues one per bank (bob-family/1 §2.1, §7.5).
+  // The allowance job runs only that bank's children. An id, not a secret.
+  ALLOWANCE_TENANT_ID: z.string().refine((v): v is (typeof KNOWN_BANKS)[number] => (KNOWN_BANKS as readonly string[]).includes(v), 'ALLOWANCE_TENANT_ID must be a known BOB bank id'),
   JOB_LEASE_TTL_MS: intFrom('JOB_LEASE_TTL_MS', 30_000, 1_000, 600_000),
   JOB_TICK_INTERVAL_MS: intFrom('JOB_TICK_INTERVAL_MS', 10_000, 100, 600_000),
 })
@@ -112,6 +117,18 @@ const jobsExtra = z.object({
 export type BaseConfig = z.infer<typeof base>
 export type JobsConfig = BaseConfig & z.infer<typeof jobsExtra>
 export type Config<R extends Role = Role> = R extends 'jobs' ? JobsConfig : BaseConfig
+
+/**
+ * CS-3979 T8: the server runs on the real clock only. There is no test-clock,
+ * time-offset or fake-time setting, and any key that looks like one refuses
+ * start-up, so no deployed configuration can accelerate or backdate a cycle.
+ */
+export function clockOverrideKeys(env: Record<string, string | undefined>): string[] {
+  return Object.keys(env)
+    .filter((k) => env[k] !== undefined && env[k] !== '')
+    .filter((k) => /CLOCK|FAKE_?TIME|TIME_?TRAVEL|TIME_?OFFSET|NOW_?OVERRIDE/i.test(k))
+    .sort()
+}
 
 /** Refuse BOB teller or blanket credentials anywhere in the supplied environment. */
 export function forbiddenCredentialKeys(env: Record<string, string | undefined>): string[] {
@@ -129,6 +146,9 @@ export function loadConfig<R extends Role>(role: R, env: Record<string, string |
       `forbidden BOB credential key(s) present: ${forbidden.join(', ')} (the server holds no BOB teller or blanket credential)`,
     )
   }
+  const clocks = clockOverrideKeys(env)
+  if (clocks.length > 0) problems.push(`clock override key(s) present: ${clocks.join(', ')} (the server runs on the real clock only)`)
+  if (role === 'jobs' && !env.BOB_API_URL) problems.push('BOB_API_URL is required in the jobs process (the allowance job calls BOB)')
   if (role !== 'jobs' && env.BOB_ALLOWANCE_CREDENTIAL) {
     problems.push('BOB_ALLOWANCE_CREDENTIAL is only permitted in the jobs process')
   }

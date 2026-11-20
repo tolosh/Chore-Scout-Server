@@ -56,6 +56,12 @@ export class LeaseLock {
     }
   }
 
+  /** True while `holder` still holds the live lease with this fencing token (a stale leader stops before acting). */
+  async holds(name: string, holder: string, token: number): Promise<boolean> {
+    const d = await this.coll.findOne({ _id: name, holder, token, expiresAt: { $gt: this.now() } }, { projection: { _id: 1 } })
+    return d !== null
+  }
+
   /** Release only if we still hold it. Returns true if released. */
   async release(name: string, holder: string): Promise<boolean> {
     const res = await this.coll.updateOne(

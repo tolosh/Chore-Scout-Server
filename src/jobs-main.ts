@@ -1,15 +1,18 @@
-/** Job process entry point: one process per environment; the lease guarantees a single runner. */
+/** Job process entry point: one process per environment; the lease guarantees a single runner. Real clock only. */
 import { hostname } from 'node:os'
 import { bootConfig } from './boot.js'
 import { connectMongo } from './db.js'
-import { JOBS, JobRunner } from './jobs/runner.js'
+import { buildJobs } from './jobs/registry.js'
+import { JobRunner } from './jobs/runner.js'
 import { createLogger } from './logger.js'
 
 const config = await bootConfig('jobs')
 const log = createLogger(config.LOG_LEVEL, config.GIT_SHA)
 const client = await connectMongo(config)
-const runner = new JobRunner(client.db(config.MONGODB_DB), `jobs:${hostname()}:${process.pid}`, config.JOB_LEASE_TTL_MS, JOBS, log)
-log.info({ jobs: JOBS.map((j) => j.name) }, 'job process started')
+const db = client.db(config.MONGODB_DB)
+const jobs = buildJobs(db, config)
+const runner = new JobRunner(db, `jobs:${hostname()}:${process.pid}`, config.JOB_LEASE_TTL_MS, jobs, log)
+log.info({ jobs: jobs.map((j) => j.name), tenant: config.ALLOWANCE_TENANT_ID }, 'job process started')
 
 let stopping = false
 const loop = async () => {

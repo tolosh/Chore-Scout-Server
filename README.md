@@ -24,7 +24,7 @@ The spec names Node/TypeScript, MongoDB and in-memory database tests. Where it i
 | `src/app.ts`, `src/main.ts` | API process: `/health` (reports the git SHA), `/ready` (database ping), correlation ids |
 | `src/healthcheck.ts` | Container health check: `/ready` via Node's fetch (CS-3992) |
 | `scripts/deploy.sh`, `infra/` | Digest-pinned dev deploy and its task definitions and IAM JSON (CS-3992) |
-| `src/jobs/`, `src/jobs-main.ts` | Single-runner job host (lease lock). No jobs registered yet: the allowance job is CS-3979 |
+| `src/jobs/`, `src/jobs-main.ts` | Single-runner job host (lease lock) and the scheduled allowance-cycle job (CS-3979), run by `npm run start:jobs` |
 | `src/migrations/` | Collections and indexes for the spec §5 data model |
 | `src/lease.ts` | Lease lock without upserts (DocumentDB E11000 finding) |
 
@@ -49,6 +49,8 @@ GIT_SHA=$(git rev-parse HEAD) MONGODB_URI=mongodb://localhost:27017 MONGODB_DB=c
 - Secrets have no defaults in code. Without `GIT_SHA`, `MONGODB_URI` or `MONGODB_DB` every process exits with code 78.
 - Set `CS_SECRETS_ID` to read a JSON secret from AWS Secrets Manager. A key set in both the environment and the secret is refused.
 - The server holds no BOB teller credential and no blanket BOB credential. Any `*TELLER*` key, or any `BOB_*` key other than `BOB_ALLOWANCE_CREDENTIAL`, refuses start-up. `BOB_ALLOWANCE_CREDENTIAL` is required by the jobs process and refused by the API process.
+- The jobs process also requires `BOB_API_URL` and `ALLOWANCE_TENANT_ID`, the BOB bank the allowance credential was issued for. The allowance job runs only that bank's children.
+- Real clock only: there is no test-clock or time-offset setting, and any key that looks like one refuses start-up in every process.
 - `BOB_API_URL` is the one non-credential `BOB_*` key. It is refused if it carries userinfo, a query or a fragment. Without it the API starts, but every GraphQL request gets 503 `UPSTREAM_UNAVAILABLE`.
 - See `.env.example` for every key.
 
@@ -61,6 +63,20 @@ The DSL forwards each person's BOB access token unchanged as `Authorization: Bea
 - otherwise the operation runs as that person.
 
 A successful answer is cached in process memory only, keyed by the token's SHA-256, for at most 30 seconds from BOB's `checked_at` (and of our own clock), and never past the token's `access_expires_at`. Failures are never cached, and a 401 from any BOB route drops the entry. Family scope is BOB's `children` list (Guardian) or the child's own id, never the `families` table or a client-supplied id. The token is never logged; log lines carry BOB's `session_id` and `customer_id`. Introspection is refused in production.
+
+## Allowance job (CS-3979)
+
+The jobs process runs one scheduled job, `allowance-cycles`, as the holder of the `scheduler` lease, on the real clock. Every allowance week runs Monday 00:00 to Monday 00:00 Australia/Sydney (D55), so each week's cut-off is the next Monday 00:00 Sydney. On each tick the job:
+
+- takes every cycle of the credential's bank whose cut-off has passed and that has no final record, from the rule's first effective period onwards, and runs it through `AllowanceCycleService`: one recorded decision per cycle key, and on PAY one BOB execution (bob-family/1 §7.5) with key `cs:<cycleKey>:allowance` for exactly the rule's amount;
+- never decides a week before its cut-off, never creates a cycle before the rule's start date or its `effectiveFrom`, and pays a cycle missed during an outage once, at its own amount, logging it as late;
+- claims a cycle before its BOB call, so two runners never send the same instruction at once, and checks it still holds the lease before each cycle;
+- re-sends an unknown outcome with the original key only, no sooner than a minute after the last attempt; records BOB's refusals (revoked authority, amount not authorised, ...) as FAILED, without retrying them;
+- holds a cycle for an operator after repeated answers that don't match what was asked: audited, logged at error level, and not re-sent.
+
+While a decided payment is unsettled, `setAllowance` refuses a change to the mode, amount, split or source account (NOT_ALLOWED_IN_STATE), so the payment always settles under the rule it was decided on.
+
+Deploying the jobs process as its own ECS service is separate work.
 
 ## Images and deploys
 

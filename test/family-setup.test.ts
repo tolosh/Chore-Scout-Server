@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type { Db } from 'mongodb'
-import { JOBS } from '../src/jobs/runner.js'
+import { REGISTERED_JOBS } from '../src/jobs/registry.js'
 import { runMigrations } from '../src/migrations/index.js'
 import { slotKey } from '../src/family-setup/service.js'
 import { FakeBob } from './fakes/bob.js'
@@ -235,7 +235,8 @@ describe('T6: no server-issued credentials, no pairing codes, no contact details
   })
 
   it('no scheduled job exists that could complete a set-up without Sarah', () => {
-    expect(JOBS.map((j) => j.name)).toEqual([])
+    // The only scheduled job is the allowance cycle (CS-3979); it creates no family set-up.
+    expect([...REGISTERED_JOBS]).toEqual(['allowance-cycles'])
   })
 })
 
