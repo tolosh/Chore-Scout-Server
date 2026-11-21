@@ -94,7 +94,18 @@ The jobs process marks the log lines an alarm should count with a stable `alert`
 | `ALLOWANCE_LEASE_LOST` | warn | A leader lost its lease mid-tick and stopped. |
 | `JOB_FAILED` | error | A registered job threw out of its run. |
 
-The metric filters, alarms and their owner are deployment work (CS-3992). Deploying the jobs process as its own ECS service is separate work.
+### Jobs runtime (CS-3992)
+
+- One ECS service per bank, `chore-scout-jobs-<bank>`, from `infra/ecs-task-definition.jobs.json`. Each has its own task role (`infra/iam/jobs-task-role-policy.json`, which reads only `chore-scout-server/jobs-<bank>`), its own security group with no inbound rules, and a heartbeat health check (`dist/jobs-healthcheck.js`).
+- `scripts/deploy-jobs.sh` (deploy workflow `target: jobs-<bank>`):
+  - never builds;
+  - requires the API to already run the same digest, so its migrations ran;
+  - updates the task definition only and never sets a desired count;
+  - refuses a running jobs service without `jobs_running_ack`.
+- Jobs are created and deployed at desired 0. Starting them is activation (runbook J7), never a deploy.
+- Alarms come from `infra/monitoring/jobs-monitoring.json` via `scripts/jobs-alarms.sh` (dry run by default).
+- Hold recovery is `node dist/jobs-recover-main.js` as a one-off task (diagnose, then `--recheck` with the original key only).
+- Full procedure: [docs/JOBS-RELEASE-RUNBOOK.md](docs/JOBS-RELEASE-RUNBOOK.md). Isolated integration against real BOB: `integration/bob-local/run.sh`.
 
 ## Images and deploys
 

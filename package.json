@@ -13,7 +13,7 @@
     "start:jobs": "node dist/jobs-main.js",
     "migrate": "node dist/migrate-main.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "eslint src test scripts",
+    "lint": "eslint src test scripts integration",
     "test": "vitest run",
     "schema:check": "tsx scripts/schema-compat.ts"
   },

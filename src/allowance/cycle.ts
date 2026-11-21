@@ -24,7 +24,7 @@
  */
 import { MongoServerError, type Collection, type Db } from 'mongodb'
 import { audit } from '../audit.js'
-import type { BobAllowanceExecutor, SplitCents } from '../bob/allowance.js'
+import type { BobAllowanceExecutor, Execution, SplitCents } from '../bob/allowance.js'
 import type { JobDoc } from '../chores/service.js'
 import { markUnavailable, reconcileWithSweep } from '../giving/preference.js'
 import { cycleKeyOf, decideCycle, type CycleDecision } from './decide.js'
@@ -73,6 +73,39 @@ export interface AllowanceCycleDoc {
 }
 
 export type CycleRun = { outcome: 'NOT_DUE' | 'INVALID_PERIOD'; detail: string } | { outcome: 'RECORDED'; cycle: AllowanceCycleDoc }
+
+/**
+ * BOB's 201 is exactly what was asked (bob-family/1 §7.5): this child and cycle,
+ * the decided amount, one funding leg, and the decided automatic split. The Save
+ * leg is purpose `split`. The Give leg's purpose follows BOB's give_outcome:
+ * `split` when the share was swept to the child's charity (donated), and
+ * `give_unresolved` when it is held because no eligible recipient is confirmed
+ * (§2.5, §6.1, §6.2). Found against real BOB 204ceaa in the isolated integration:
+ * a held Give share was taken as a mismatch and the cycle held for an operator.
+ */
+export function answerMatches(c: AllowanceCycleDoc, e: Execution): boolean {
+  const split = c.splitCents!
+  const funding = e.legs.filter((l) => l.purpose === 'allowance_funding')
+  const others = e.legs.filter((l) => l.purpose !== 'allowance_funding')
+  const give = e.giveOutcome
+  if (split.give > 0 && (give === null || give.status === 'none' || give.amountCents !== split.give)) return false
+  if (split.give === 0 && give !== null && give.status !== 'none') return false
+  const giveLegPurpose = give?.status === 'held' ? 'give_unresolved' : 'split'
+  const want = [...(split.save > 0 ? [`split:${split.save}`] : []), ...(split.give > 0 ? [`${giveLegPurpose}:${split.give}`] : [])].sort()
+  const got = others.map((l) => `${l.purpose}:${l.amountCents}`).sort()
+  return (
+    e.childCustomerId === c.childCustomerId &&
+    e.cycleRef === c.periodStart &&
+    e.amountCents === c.amountCents &&
+    funding.length === 1 &&
+    funding[0]!.amountCents === c.amountCents &&
+    others.every((l) => l.origin === 'automatic') &&
+    JSON.stringify(got) === JSON.stringify(want)
+  )
+}
+
+/** What an operator's recheck of a held cycle found (recheckHeld). */
+export type RecheckOutcome = 'RESOLVED_EXECUTED' | 'RESOLVED_FAILED' | 'STILL_MISMATCHED' | 'STILL_UNKNOWN' | 'NOT_HELD' | 'BUSY'
 
 export class AllowanceCycleService {
   private readonly cycles: Collection<AllowanceCycleDoc>
@@ -145,22 +178,7 @@ export class AllowanceCycleService {
     let final = false
     if (out.kind === 'ok') {
       const e = out.value
-      const split = c.splitCents!
-      const funding = e.legs.filter((l) => l.purpose === 'allowance_funding')
-      const splits = e.legs.filter((l) => l.purpose === 'split')
-      const want = [split.save, split.give].filter((n) => n > 0).sort((a, b) => a - b)
-      const got = splits.map((l) => l.amountCents).sort((a, b) => a - b)
-      const giveOk = split.give === 0 || (e.giveOutcome !== null && e.giveOutcome.status !== 'none' && e.giveOutcome.amountCents === split.give)
-      const matches =
-        e.childCustomerId === c.childCustomerId &&
-        e.cycleRef === c.periodStart &&
-        e.amountCents === c.amountCents &&
-        funding.length === 1 &&
-        funding[0]!.amountCents === c.amountCents &&
-        splits.every((l) => l.origin === 'automatic') &&
-        JSON.stringify(got) === JSON.stringify(want) &&
-        giveOk
-      if (!matches) {
+      if (!answerMatches(c, e)) {
         // Outside the contract: never shown as paid on an answer that doesn't match what was asked.
         // The hold is decided from the stored count after this increment, never from the copy read
         // before the claim, which another sender may have moved on since (review 40045 A1). The claim
@@ -204,5 +222,67 @@ export class AllowanceCycleService {
       await audit(this.db, { actor: 'allowance-cycle', tenantId: done.tenantId, action: `allowance.cycle_${done.status.toLowerCase()}`, subject: done.cycleKey, after: { bobOperationRef: done.bobOperationRef, bobReason: done.bobReason, amountCents: done.amountCents }, correlation }, now)
     }
     return done
+  }
+
+  /**
+   * Operator recovery for a held cycle (review 40045 A3; review 40503 item 6).
+   * Re-sends the cycle's ORIGINAL key and amount once, under the same claim as
+   * any sender, and records BOB's answer. The hold is cleared only when that
+   * answer settles the cycle: a matching 201 or CYCLE_ALREADY_PAID (EXECUTED),
+   * or one of BOB's final refusals (FAILED). A mismatch again, or an unknown
+   * outcome, keeps the hold. It never invents a key, never changes the amount,
+   * and never clears a hold on an operator's say-so. Every recheck is audited
+   * with the operator and their reason, before and after the BOB call.
+   */
+  async recheckHeld(cycleKey: string, tenantId: string, operator: string, reason: string, correlation: string): Promise<{ outcome: RecheckOutcome; cycle: AllowanceCycleDoc | null }> {
+    const at = this.now()
+    const claim = await this.cycles.updateOne(
+      { cycleKey, tenantId, status: 'DECIDED', decision: 'PAY', operatorHold: { $ne: null }, $or: [{ claimUntil: null }, { claimUntil: { $lte: at } }] },
+      { $set: { claimUntil: new Date(at.getTime() + SEND_CLAIM_MS) } },
+    )
+    if (claim.modifiedCount !== 1) {
+      const doc = await this.cycles.findOne({ cycleKey, tenantId }, { projection: { _id: 0 } })
+      const held = doc !== null && doc.status === 'DECIDED' && doc.decision === 'PAY' && Boolean(doc.operatorHold)
+      return { outcome: held ? 'BUSY' : 'NOT_HELD', cycle: doc }
+    }
+    const c = (await this.cycles.findOne({ cycleKey }, { projection: { _id: 0 } }))!
+    const before = { operator, reason, hold: c.operatorHold ?? null, mismatches: c.mismatches ?? 0, attempts: c.attempts }
+    await audit(this.db, { actor: `operator:${operator}`, tenantId, action: 'allowance.cycle_hold_recheck', subject: cycleKey, after: before, correlation }, at)
+    const out = await this.bob.execute(c.authorityId, c.cycleKey, { childCustomerId: c.childCustomerId, cycleRef: c.periodStart, amountCents: c.amountCents! })
+    const now = this.now()
+    const decided = { cycleKey, status: 'DECIDED' as const }
+    let outcome: RecheckOutcome
+    if (out.kind === 'ok' && answerMatches(c, out.value)) {
+      const e = out.value
+      await this.cycles.updateOne(decided, { $set: { status: 'EXECUTED', bobOperationRef: e.executionId, bobReason: null, operatorHold: null, claimUntil: null, updatedAt: now }, $inc: { attempts: 1 } })
+      if (e.giveOutcome?.status === 'held') await markUnavailable(this.db, c.childCustomerId, now)
+      if (e.giveOutcome?.status === 'donated' && e.giveOutcome.recipient) await reconcileWithSweep(this.db, c.childCustomerId, c.tenantId, e.giveOutcome.recipient, now, correlation)
+      outcome = 'RESOLVED_EXECUTED'
+    } else if (out.kind === 'ok') {
+      await this.cycles.updateOne(decided, { $set: { bobReason: 'UPSTREAM_MISMATCH', claimUntil: null, updatedAt: now }, $inc: { attempts: 1, mismatches: 1 } })
+      await audit(
+        this.db,
+        { actor: `operator:${operator}`, tenantId, action: 'allowance.cycle_hold_recheck_mismatch', subject: cycleKey, after: { asked: { amountCents: c.amountCents, splitCents: c.splitCents }, got: { executionId: out.value.executionId, amountCents: out.value.amountCents, legs: out.value.legs } }, correlation },
+        now,
+      )
+      outcome = 'STILL_MISMATCHED'
+    } else if (out.kind === 'refused' && out.code === 'CYCLE_ALREADY_PAID') {
+      await this.cycles.updateOne(decided, { $set: { status: 'EXECUTED', bobOperationRef: String(out.error.execution_id ?? ''), bobReason: 'CYCLE_ALREADY_PAID', operatorHold: null, claimUntil: null, updatedAt: now }, $inc: { attempts: 1 } })
+      outcome = 'RESOLVED_EXECUTED'
+    } else if (out.kind === 'refused' && FAILED_CODES.has(out.code)) {
+      await this.cycles.updateOne(decided, { $set: { status: 'FAILED', bobReason: out.code, operatorHold: null, claimUntil: null, updatedAt: now }, $inc: { attempts: 1 } })
+      outcome = 'RESOLVED_FAILED'
+    } else {
+      await this.cycles.updateOne(decided, { $set: { bobReason: out.kind === 'refused' ? out.code : 'UPSTREAM_UNAVAILABLE', claimUntil: null, updatedAt: now }, $inc: { attempts: 1 } })
+      outcome = 'STILL_UNKNOWN'
+    }
+    const done = await this.cycles.findOne({ cycleKey }, { projection: { _id: 0 } })
+    const resolved = outcome === 'RESOLVED_EXECUTED' || outcome === 'RESOLVED_FAILED'
+    await audit(
+      this.db,
+      { actor: `operator:${operator}`, tenantId, action: resolved ? 'allowance.cycle_hold_resolved' : 'allowance.cycle_hold_kept', subject: cycleKey, before, after: { outcome, status: done?.status, bobReason: done?.bobReason, bobOperationRef: done?.bobOperationRef }, correlation },
+      now,
+    )
+    return { outcome, cycle: done }
   }
 }

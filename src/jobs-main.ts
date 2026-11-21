@@ -3,6 +3,7 @@ import { hostname } from 'node:os'
 import { bootConfig } from './boot.js'
 import { connectMongo } from './db.js'
 import { buildJobs } from './jobs/registry.js'
+import { touchHeartbeat } from './jobs/heartbeat.js'
 import { JobRunner, schedulerLeaseFor } from './jobs/runner.js'
 import { createLogger } from './logger.js'
 
@@ -22,6 +23,12 @@ const loop = async () => {
       await runner.tick()
     } catch (err) {
       log.error({ err: (err as Error).message }, 'scheduler tick failed')
+    }
+    // Liveness for the container health check (jobs-healthcheck.ts), leader or not.
+    try {
+      touchHeartbeat()
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'could not write the jobs heartbeat')
     }
     await new Promise((r) => setTimeout(r, config.JOB_TICK_INTERVAL_MS))
   }

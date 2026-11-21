@@ -447,12 +447,16 @@ export function installFamilyRoutes(bob: FakeBob): void {
     const legs: Record<string, unknown>[] = [
       { leg_id: move(bob, a.from, spend, a.amountCents, 'allowance_funding', iref), purpose: 'allowance_funding', from_account_id: a.from, to_account_id: spend, amount_cents: a.amountCents },
     ]
+    let give_outcome: ReturnType<typeof sweep> | { status: 'none' } = { status: 'none' }
     for (const jar of ['save', 'give'] as const) {
       if (a.split[jar] === 0) continue
       const to = bob.accountOf(a.child, jar)!
-      legs.push({ leg_id: move(bob, spend, to, a.split[jar], 'split', iref, 'automatic'), purpose: 'split', origin: 'automatic', from_account_id: spend, to_account_id: to, amount_cents: a.split[jar] })
+      const legId = move(bob, spend, to, a.split[jar], 'split', iref, 'automatic')
+      if (jar === 'give') give_outcome = sweep(bob, a.child, a.split.give, iref)
+      // As real BOB (204ceaa creditGive): a Give leg that is held carries purpose give_unresolved; swept, split.
+      const purpose = jar === 'give' && give_outcome.status === 'held' ? 'give_unresolved' : 'split'
+      legs.push({ leg_id: legId, purpose, origin: 'automatic', from_account_id: spend, to_account_id: to, amount_cents: a.split[jar] })
     }
-    const give_outcome = a.split.give > 0 ? sweep(bob, a.child, a.split.give, iref) : { status: 'none' }
     const executionId = newId('exe')
     bob.paidCycles.set(`${a.child}|${ref}`, executionId)
     return ok(201, {
