@@ -66,7 +66,7 @@ A successful answer is cached in process memory only, keyed by the token's SHA-2
 
 ## Allowance job (CS-3979)
 
-The jobs process runs one scheduled job, `allowance-cycles`, as the holder of the `scheduler` lease, on the real clock. Every allowance week runs Monday 00:00 to Monday 00:00 Australia/Sydney (D55), so each week's cut-off is the next Monday 00:00 Sydney. On each tick the job:
+The jobs process runs one scheduled job, `allowance-cycles`, as the holder of its bank's lease, `scheduler:allowance:<ALLOWANCE_TENANT_ID>`, on the real clock. Every allowance week runs Monday 00:00 to Monday 00:00 Australia/Sydney (D55), so each week's cut-off is the next Monday 00:00 Sydney. On each tick the job:
 
 - takes every cycle of the credential's bank whose cut-off has passed and that has no final record, from the rule's first effective period onwards, and runs it through `AllowanceCycleService`: one recorded decision per cycle key, and on PAY one BOB execution (bob-family/1 §7.5) with key `cs:<cycleKey>:allowance` for exactly the rule's amount;
 - never decides a week before its cut-off, never creates a cycle before the rule's start date or its `effectiveFrom`, and pays a cycle missed during an outage once, at its own amount, logging it as late;
@@ -76,7 +76,25 @@ The jobs process runs one scheduled job, `allowance-cycles`, as the holder of th
 
 While a decided payment is unsettled, `setAllowance` refuses a change to the mode, amount, split or source account (NOT_ALLOWED_IN_STATE), so the payment always settles under the rule it was decided on.
 
-Deploying the jobs process as its own ECS service is separate work.
+### One runner per bank
+
+Each jobs process holds one bank's allowance credential and runs only that bank's children, so it takes only that bank's lease (review 40503 item 1). Bank of Bilgola's and Bank of Manly's runners share the database, where the API keeps the rules, but never compete for a lease: a renewing leader in one bank can't starve the other. For failover, run a second process for the same bank; it takes over when the leader's lease expires (`JOB_LEASE_TTL_MS`). No process holds two banks' credentials.
+
+### Alerts
+
+The jobs process marks the log lines an alarm should count with a stable `alert` field (`src/jobs/alerts.ts`), for example `{ $.alert = "ALLOWANCE_MISSED_RUN" }`:
+
+| Marker | Level | Meaning |
+| --- | --- | --- |
+| `event: ALLOWANCE_TICK` | info | Heartbeat: one per completed tick of a bank's leader, with `tenantId`. Its absence means no runner is paying that bank promptly. |
+| `ALLOWANCE_MISSED_RUN` | warn | A cycle was decided late: a run was missed. |
+| `ALLOWANCE_UNEXPECTED_FAILED` | warn | BOB refused a PAY with anything but `AUTHORITY_REVOKED`. Recorded FAILED, not retried. |
+| `ALLOWANCE_OPERATOR_HOLD` | error | A cycle was held after repeated mismatched answers. |
+| `ALLOWANCE_CYCLE_ERROR` | error | A cycle threw; retried next tick. |
+| `ALLOWANCE_LEASE_LOST` | warn | A leader lost its lease mid-tick and stopped. |
+| `JOB_FAILED` | error | A registered job threw out of its run. |
+
+The metric filters, alarms and their owner are deployment work (CS-3992). Deploying the jobs process as its own ECS service is separate work.
 
 ## Images and deploys
 

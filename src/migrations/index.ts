@@ -10,9 +10,10 @@ import { MongoServerError, type Db } from 'mongodb'
 import type { Logger } from 'pino'
 import { LeaseLock } from '../lease.js'
 import { migration001 } from './001-initial-collections.js'
+import { migration002 } from './002-cycle-child-status.js'
 import type { Migration } from './types.js'
 
-export const MIGRATIONS: readonly Migration[] = [migration001]
+export const MIGRATIONS: readonly Migration[] = [migration001, migration002]
 export const MIGRATIONS_COLLECTION = 'schema_migrations'
 
 export class MigrationLockBusy extends Error {

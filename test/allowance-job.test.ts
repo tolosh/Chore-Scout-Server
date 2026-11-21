@@ -13,7 +13,7 @@ import { BobAllowanceExecutor } from '../src/bob/allowance.js'
 import { BobHttp } from '../src/bob/http.js'
 import { AllowanceCycleJob, RETRY_AFTER_MS } from '../src/jobs/allowance-job.js'
 import { buildJobs } from '../src/jobs/registry.js'
-import { JobRunner } from '../src/jobs/runner.js'
+import { JobRunner, schedulerLeaseFor } from '../src/jobs/runner.js'
 import { runMigrations } from '../src/migrations/index.js'
 import { FakeBob } from './fakes/bob.js'
 import { BOB_URL, buildTestApi } from './helpers/api.js'
@@ -63,8 +63,8 @@ const log = {
 }
 const clock = () => new Date(t)
 const job = (cred = credential, tenant = TENANT) => new AllowanceCycleJob(db, tenant, new AllowanceCycleService(db, new BobAllowanceExecutor(new BobHttp({ baseUrl: BOB_URL, timeoutMs: 1_000, fetch: bob.fetch }), cred), clock))
-const runner = (holder = 'jobs:a', j = job()) => new JobRunner(db, holder, 30_000, [j], log as never, clock)
-const tick = (holder = 'jobs:a', j = job()) => runner(holder, j).tick()
+const runner = (holder = 'jobs:a', j = job(), tenant = TENANT) => new JobRunner(db, schedulerLeaseFor(tenant), holder, 30_000, [j], log as never, clock)
+const tick = (holder = 'jobs:a', j = job(), tenant = TENANT) => runner(holder, j, tenant).tick()
 
 const api = () => buildTestApi({ db, bob, now: () => t, clock: () => new Date(t) })
 const SET = `mutation($c: ID!, $m: CsAllowanceMode!, $lc: CsLinkedCondition, $key: ID!, $f: ID, $v: Int) {
@@ -236,7 +236,7 @@ describe('T6: the credential can only execute a recorded allowance authority', (
   it('a job configured for another bank never runs this bank’s children', async () => {
     await setUp(LEO)
     t = syd(P2, 0, 1)
-    await tick('jobs:a', job(bob.issueAllowanceCredential('bank_manly'), 'bank_manly'))
+    await tick('jobs:a', job(bob.issueAllowanceCredential('bank_manly'), 'bank_manly'), 'bank_manly')
     expect(execCalls()).toHaveLength(0)
     expect(await cycleDocs()).toHaveLength(0)
   })
@@ -255,8 +255,8 @@ describe('T8: real clock only', () => {
   it('the jobs process and its registry take no clock: the runner and every job use the system time', () => {
     const main = readFileSync(new URL('../src/jobs-main.ts', import.meta.url), 'utf8')
     const registry = readFileSync(new URL('../src/jobs/registry.ts', import.meta.url), 'utf8')
-    // JobRunner(db, holder, ttl, jobs, log) with no sixth (clock) argument.
-    expect(main).toMatch(/new JobRunner\(db, [^,]+, config\.JOB_LEASE_TTL_MS, jobs, log\)/)
+    // JobRunner(db, lease, holder, ttl, jobs, log) with no seventh (clock) argument.
+    expect(main).toMatch(/new JobRunner\(db, lease, [^,]+, config\.JOB_LEASE_TTL_MS, jobs, log\)/)
     expect(registry).toMatch(/const realClock = \(\) => new Date\(\)/)
     expect(registry).not.toMatch(/process\.env/)
     const jobs = buildJobs(db, { BOB_API_URL: BOB_URL, BOB_CALL_TIMEOUT_MS: 1_000, BOB_ALLOWANCE_CREDENTIAL: credential, ALLOWANCE_TENANT_ID: TENANT }, bob.fetch)
@@ -269,7 +269,7 @@ describe('T8: real clock only', () => {
     const thisWeek = (await import('../src/allowance/decide.js')).weekStartOf(now)
     await db.collection('allowance_rules').insertOne({ childCustomerId: LEO, tenantId: TENANT, startDate: thisWeek, effectiveFrom: thisWeek, timezone: 'Australia/Sydney', mode: 'FREE', amountCents: 1000, splitCents: { spend: 1000, save: 0, give: 0 }, authorityId: 'auth_x', version: 1 })
     const [j] = buildJobs(db, { BOB_API_URL: BOB_URL, BOB_CALL_TIMEOUT_MS: 1_000, BOB_ALLOWANCE_CREDENTIAL: credential, ALLOWANCE_TENANT_ID: TENANT }, bob.fetch)
-    await new JobRunner(db, 'jobs:real', 30_000, [j!], log as never).tick()
+    await new JobRunner(db, schedulerLeaseFor(TENANT), 'jobs:real', 30_000, [j!], log as never).tick()
     expect(execCalls()).toHaveLength(0)
     expect(await cycleDocs()).toHaveLength(0)
   })
