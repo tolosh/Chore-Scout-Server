@@ -63,6 +63,11 @@ export class JobRunner {
     this.lock = new LeaseLock(db, now)
   }
 
+  /** The bank of a per-bank lease, for alert dimensions; null for any other lease name. */
+  private get tenantId(): string | null {
+    return this.leaseName.startsWith(SCHEDULER_LEASE_PREFIX) ? this.leaseName.slice(SCHEDULER_LEASE_PREFIX.length) : null
+  }
+
   async tick(): Promise<TickResult> {
     const lease = await this.lock.tryAcquire(this.leaseName, this.holder, this.leaseTtlMs)
     if (!lease) return { leader: false, ran: [], failed: [] }
@@ -74,7 +79,7 @@ export class JobRunner {
         ran.push(job.name)
       } catch (err) {
         failed.push(job.name)
-        this.log.error({ job: job.name, lease: this.leaseName, err: (err as Error).message, alert: ALERT.JOB_FAILED }, 'job failed')
+        this.log.error({ job: job.name, lease: this.leaseName, tenantId: this.tenantId, err: (err as Error).message, alert: ALERT.JOB_FAILED }, 'job failed')
       }
     }
     return { leader: true, ran, failed }

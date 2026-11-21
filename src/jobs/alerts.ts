@@ -21,6 +21,8 @@
  *   retried next tick.
  * - ALLOWANCE_LEASE_LOST: a leader lost its bank's lease mid-tick and stopped.
  * - JOB_FAILED: a registered job threw out of its run.
+ * - ALLOWANCE_HOLD_RECHECKED: an operator rechecked a held cycle (jobs-recover);
+ *   counted for visibility, not an alarm on its own.
  */
 export const ALLOWANCE_TICK_EVENT = 'ALLOWANCE_TICK'
 
@@ -31,6 +33,7 @@ export const ALERT = {
   CYCLE_ERROR: 'ALLOWANCE_CYCLE_ERROR',
   LEASE_LOST: 'ALLOWANCE_LEASE_LOST',
   JOB_FAILED: 'JOB_FAILED',
+  HOLD_RECHECKED: 'ALLOWANCE_HOLD_RECHECKED',
 } as const
 
 /** BOB refusals that are an expected product outcome, not an alert. */

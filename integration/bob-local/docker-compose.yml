@@ -1,0 +1,59 @@
+# Isolated integration of the Chore Scout jobs runtime against real BOB
+# (CS-3979, CS-3992). Run with integration/bob-local/run.sh, which builds both
+# images first (with internet), then runs this stack on an INTERNAL network:
+# no container here can reach AWS, Odyssey, Resend, SQS or the internet, and
+# nothing is published on the host.
+#
+# BOB runs exactly as its image does in ECS (SERVICE_MODE=bob), with every
+# outside service unset or pointed at an unreachable local address:
+# - TRANSACTIONS_QUEUE_URL empty: the SQS drainer never starts;
+# - BOB_CHARITY_ROUTING_KEYS '{}': charity routing is "not configured", so Give
+#   credits are held (fail closed), with no AWS or HTTP call;
+# - ODYSSEY_INGEST_URL / PERSONA_GENERATOR_URL: an unreachable local port;
+# - BOB_PLAYER_REF_SECRET / BOB_JWT_SECRET / keys: throwaway values for this run.
+name: cs-jobs-it
+networks:
+  isolated:
+    internal: true
+services:
+  mongo:
+    image: mongo:7.0.14
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    networks: [isolated]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status().ok } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }).ok }"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  bob:
+    image: cs-it-bob:${BOB_SHA}
+    networks: [isolated]
+    depends_on:
+      mongo: { condition: service_healthy }
+    environment:
+      SERVICE_MODE: bob
+      NODE_ENV: production
+      PORT: "3000"
+      MONGODB_URI: mongodb://mongo:27017/odyssey_rehearsal?replicaSet=rs0
+      TRANSACTIONS_QUEUE_URL: ""
+      BOB_CHARITY_ROUTING_KEYS: "{}"
+      ODYSSEY_INGEST_URL: http://127.0.0.1:9/disabled
+      PERSONA_GENERATOR_URL: http://127.0.0.1:9/disabled
+      BOB_PLAYER_REF_SECRET: it-throwaway-player-ref-secret-not-a-real-secret
+      BOB_JWT_SECRET: it-throwaway-jwt-secret-not-a-real-secret
+      API_KEY: it-throwaway
+      INTERNAL_AUTH_KEY: it-throwaway
+      AWS_ACCESS_KEY_ID: ""
+      AWS_SECRET_ACCESS_KEY: ""
+      AWS_PROFILE: ""
+  harness:
+    image: cs-it-harness:${SERVER_SHA}
+    networks: [isolated]
+    depends_on:
+      mongo: { condition: service_healthy }
+      bob: { condition: service_started }
+    environment:
+      MONGO_URL: mongodb://mongo:27017/?replicaSet=rs0
+      BOB_URL: http://bob:3000
+      GIT_SHA: ${SERVER_SHA}
+    command: ["node", "--import", "tsx", "integration/bob-local/harness.ts"]

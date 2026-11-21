@@ -41,6 +41,18 @@
       "Resource": "arn:aws:ecs:ap-southeast-2:932027117528:service/moroku-dsl-dev/chore-scout-api"
     },
     {
+      "Sid": "UpdateTheTwoBankJobsServicesTaskDefinitionOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:UpdateService"
+      ],
+      "Resource": [
+        "arn:aws:ecs:ap-southeast-2:932027117528:service/moroku-dsl-dev/chore-scout-jobs-bank_bilgola",
+        "arn:aws:ecs:ap-southeast-2:932027117528:service/moroku-dsl-dev/chore-scout-jobs-bank_manly"
+      ]
+    },
+    {
       "Sid": "ReadSecurityGroupNamesNoResourceLevelSupport",
       "Effect": "Allow",
       "Action": "ec2:DescribeSecurityGroups",
@@ -64,12 +76,14 @@
       "Resource": "arn:aws:ecs:ap-southeast-2:932027117528:task/moroku-dsl-dev/*"
     },
     {
-      "Sid": "PassOnlyTheTwoServerRolesToEcsTasks",
+      "Sid": "PassOnlyTheServerRolesToEcsTasks",
       "Effect": "Allow",
       "Action": "iam:PassRole",
       "Resource": [
         "arn:aws:iam::932027117528:role/chore-scout-server-task-role",
-        "arn:aws:iam::932027117528:role/chore-scout-server-execution-role"
+        "arn:aws:iam::932027117528:role/chore-scout-server-execution-role",
+        "arn:aws:iam::932027117528:role/chore-scout-jobs-bank_bilgola-task-role",
+        "arn:aws:iam::932027117528:role/chore-scout-jobs-bank_manly-task-role"
       ],
       "Condition": {
         "StringEquals": {

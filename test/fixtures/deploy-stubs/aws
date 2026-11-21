@@ -3,8 +3,17 @@
 set -euo pipefail
 echo "aws $*" >>"$STUB_DIR/calls.log"
 case "$1 $2" in
-  "ecs describe-services") echo "$STUB_SERVICES_JSON" ;;
-  "ecs describe-task-definition") echo "$STUB_PREV_IMAGE" ;;
+  "ecs describe-services")
+    # Per-service answer when $STUB_DIR/service-<name>.json exists (jobs deploy tests); else the shared one.
+    svc=""; args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do [[ "${args[$i]}" == --services ]] && svc=${args[$((i + 1))]}; done
+    if [[ -n "$svc" && -f "$STUB_DIR/service-$svc.json" ]]; then cat "$STUB_DIR/service-$svc.json"; else echo "$STUB_SERVICES_JSON"; fi ;;
+  "ecs describe-task-definition")
+    # Per-family image when $STUB_DIR/td-image-<family> exists; else the shared rollback image.
+    td=""; args=("$@")
+    for ((i = 0; i < ${#args[@]}; i++)); do [[ "${args[$i]}" == --task-definition ]] && td=${args[$((i + 1))]}; done
+    fam=${td##*task-definition/}; fam=${fam%%:*}
+    if [[ -n "$fam" && -f "$STUB_DIR/td-image-$fam" ]]; then cat "$STUB_DIR/td-image-$fam"; else echo "$STUB_PREV_IMAGE"; fi ;;
   "ec2 describe-security-groups")
     if [[ "${STUB_SG_RC:-0}" != 0 ]]; then
       echo "An error occurred (InvalidGroup.NotFound) when calling the DescribeSecurityGroups operation" >&2
@@ -40,6 +49,8 @@ case "$1 $2" in
   "ecs describe-tasks")
     jq -n --argjson code "$STUB_MIGRATE_EXIT" \
       '{tasks:[{stoppedReason:"Essential container in task exited",containers:[{name:"chore-scout-migrate",exitCode:$code}]}]}' ;;
-  "ecs update-service") jq -n --argjson d "$STUB_DESIRED" '{service:{desiredCount:$d}}' ;;
+  "ecs update-service")
+    if [[ " $* " == *" --desired-count "* ]]; then echo "aws stub: update-service must not set --desired-count here: $*" >&2; exit 98; fi
+    jq -n --argjson d "$STUB_DESIRED" '{service:{desiredCount:$d}}' ;;
   *) echo "aws stub: unexpected call: $*" >&2; exit 99 ;;
 esac

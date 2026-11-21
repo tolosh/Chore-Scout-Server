@@ -15,11 +15,35 @@ name: deploy
 # bootstrap (default false): allow a first run before the service exists. It
 # is accepted only when the service is MISSING; it pushes the image and
 # registers the task definitions, and deploys and migrates nothing.
+#
+# target (default api): api runs scripts/deploy.sh (build, push, migrate, API).
+# jobs-bank_bilgola / jobs-bank_manly run scripts/deploy-jobs.sh for that one
+# bank's allowance jobs service (CS-3979): no build (the API deploy of the same
+# SHA must have pushed the image and migrated), task definition only, and the
+# desired count is never set, so a stopped jobs service stays stopped. Starting
+# jobs is an activation step in the runbook, not a deploy.
+#
+# jobs_running_ack (default false): only for a jobs target whose service is
+# already running (desired > 0, after activation). Without it that deploy is refused.
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: 'What to deploy: api, or one bank''s jobs service (task definition only; desired count untouched)'
+        type: choice
+        required: true
+        default: api
+        options:
+          - api
+          - jobs-bank_bilgola
+          - jobs-bank_manly
       bootstrap:
         description: 'First run only: the service does not exist yet; register task definitions, deploy nothing'
+        type: boolean
+        required: false
+        default: false
+      jobs_running_ack:
+        description: 'Jobs targets only: the jobs service is running (desired > 0) and replacing its task definition is an approved release'
         type: boolean
         required: false
         default: false
@@ -28,7 +52,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-chore-scout-api
+  group: deploy-chore-scout-${{ inputs.target }}
   cancel-in-progress: false
 
 jobs:
@@ -65,7 +89,15 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           role-session-name: chore-scout-deploy-${{ github.run_id }}
           aws-region: ap-southeast-2
-      - name: Build, push, migrate and deploy (digest-pinned)
+      - name: Build, push, migrate and deploy the API (digest-pinned)
+        if: ${{ inputs.target == 'api' }}
         env:
           DEPLOY_BOOTSTRAP: ${{ inputs.bootstrap && '1' || '0' }}
         run: bash scripts/deploy.sh "$GITHUB_SHA"
+      - name: Point one bank's jobs service at this digest (desired count untouched)
+        if: ${{ startsWith(inputs.target, 'jobs-') }}
+        env:
+          DEPLOY_BOOTSTRAP: ${{ inputs.bootstrap && '1' || '0' }}
+          JOBS_RUNNING_ACK: ${{ inputs.jobs_running_ack && '1' || '0' }}
+          TARGET: ${{ inputs.target }}
+        run: bash scripts/deploy-jobs.sh "$GITHUB_SHA" "${TARGET#jobs-}"

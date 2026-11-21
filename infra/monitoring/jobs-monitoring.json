@@ -1,0 +1,24 @@
+{
+  "_comment": "CS-3979 / CS-3992: log metric filters and alarms for one bank's allowance jobs. Applied per bank by scripts/jobs-alarms.sh (dry run by default). Markers come from src/jobs/alerts.ts. Alarm actions go to an SNS topic whose owner is named at activation (runbook J6); nothing here names a person.",
+  "logGroup": "/ecs/chore-scout-server",
+  "namespace": "ChoreScout/Jobs",
+  "filters": [
+    { "metric": "AllowanceTick", "field": "event", "value": "ALLOWANCE_TICK" },
+    { "metric": "AllowanceMissedRun", "field": "alert", "value": "ALLOWANCE_MISSED_RUN" },
+    { "metric": "AllowanceUnexpectedFailed", "field": "alert", "value": "ALLOWANCE_UNEXPECTED_FAILED" },
+    { "metric": "AllowanceOperatorHold", "field": "alert", "value": "ALLOWANCE_OPERATOR_HOLD" },
+    { "metric": "AllowanceCycleError", "field": "alert", "value": "ALLOWANCE_CYCLE_ERROR" },
+    { "metric": "AllowanceLeaseLost", "field": "alert", "value": "ALLOWANCE_LEASE_LOST" },
+    { "metric": "JobFailed", "field": "alert", "value": "JOB_FAILED" },
+    { "metric": "AllowanceHoldRechecked", "field": "alert", "value": "ALLOWANCE_HOLD_RECHECKED" }
+  ],
+  "alarms": [
+    { "name": "missed-run", "metric": "AllowanceMissedRun", "statistic": "Sum", "periodSeconds": 300, "evaluationPeriods": 1, "threshold": 1, "comparison": "GreaterThanOrEqualToThreshold", "treatMissingData": "notBreaching", "meaning": "A cycle was decided after a later week had ended: a run was missed. Check the job ran at the cut-off." },
+    { "name": "unexpected-failed", "metric": "AllowanceUnexpectedFailed", "statistic": "Sum", "periodSeconds": 300, "evaluationPeriods": 1, "threshold": 1, "comparison": "GreaterThanOrEqualToThreshold", "treatMissingData": "notBreaching", "meaning": "BOB refused a PAY with something other than AUTHORITY_REVOKED (wrong-bank credential, insufficient funds, ...). Not retried." },
+    { "name": "operator-hold", "metric": "AllowanceOperatorHold", "statistic": "Sum", "periodSeconds": 300, "evaluationPeriods": 1, "threshold": 1, "comparison": "GreaterThanOrEqualToThreshold", "treatMissingData": "notBreaching", "meaning": "A cycle is held after repeated mismatched answers; the Guardian cannot change the allowance until it is rechecked (runbook J9)." },
+    { "name": "cycle-error", "metric": "AllowanceCycleError", "statistic": "Sum", "periodSeconds": 300, "evaluationPeriods": 1, "threshold": 1, "comparison": "GreaterThanOrEqualToThreshold", "treatMissingData": "notBreaching", "meaning": "A cycle threw (database or code error); it is retried next tick." },
+    { "name": "lease-lost", "metric": "AllowanceLeaseLost", "statistic": "Sum", "periodSeconds": 900, "evaluationPeriods": 1, "threshold": 2, "comparison": "GreaterThanOrEqualToThreshold", "treatMissingData": "notBreaching", "meaning": "Leaders keep losing the bank's lease mid-tick: runners are flapping or the database is slow." },
+    { "name": "job-failed", "metric": "JobFailed", "statistic": "Sum", "periodSeconds": 300, "evaluationPeriods": 1, "threshold": 1, "comparison": "GreaterThanOrEqualToThreshold", "treatMissingData": "notBreaching", "meaning": "A registered job threw out of its run." },
+    { "name": "no-heartbeat", "metric": "AllowanceTick", "statistic": "Sum", "periodSeconds": 300, "evaluationPeriods": 3, "threshold": 1, "comparison": "LessThanThreshold", "treatMissingData": "breaching", "runningOnly": true, "meaning": "No leader of this bank completed a tick for 15 minutes while jobs should be running: allowances are not being paid promptly (the no-backfill condition depends on this)." }
+  ]
+}

@@ -33,7 +33,8 @@ const WILDCARD_OK = new Set([
   'ssmmessages:OpenDataChannel',
 ])
 
-const POLICIES = ['infra/iam/task-role-policy.json', 'infra/iam/execution-role-policy.json', 'infra/iam/deploy-role-policy.json']
+const POLICIES = ['infra/iam/task-role-policy.json', 'infra/iam/execution-role-policy.json', 'infra/iam/deploy-role-policy.json', 'infra/iam/jobs-task-role-policy.json']
+const BANKS = ['bank_bilgola', 'bank_manly'] as const
 const TASK_DEFS = {
   api: 'infra/ecs-task-definition.api.json',
   migrate: 'infra/ecs-task-definition.migrate.json',
@@ -68,12 +69,16 @@ describe('IAM policies (CS-3992)', () => {
     expect(ecr.flatMap((x) => list(x.Resource))).toEqual([`arn:aws:ecr:${REGION}:${ACCOUNT}:repository/chore-scout-server`])
   })
 
-  it('deploy role: one repo, one service, the migrate family, PassRole to ECS tasks for the two server roles', () => {
+  it('deploy role: one repo, the API service and the two bank jobs services, the migrate family, PassRole to ECS tasks for the server and jobs roles', () => {
     const s = statements('infra/iam/deploy-role-policy.json')
     const resourcesFor = (action: string) => s.filter((x) => list(x.Action).includes(action)).flatMap((x) => list(x.Resource))
 
     expect(resourcesFor('ecr:PutImage')).toEqual([`arn:aws:ecr:${REGION}:${ACCOUNT}:repository/chore-scout-server`])
-    expect(resourcesFor('ecs:UpdateService')).toEqual([`arn:aws:ecs:${REGION}:${ACCOUNT}:service/moroku-dsl-dev/chore-scout-api`])
+    expect(resourcesFor('ecs:UpdateService')).toEqual([
+      `arn:aws:ecs:${REGION}:${ACCOUNT}:service/moroku-dsl-dev/chore-scout-api`,
+      ...BANKS.map((b) => `arn:aws:ecs:${REGION}:${ACCOUNT}:service/moroku-dsl-dev/chore-scout-jobs-${b}`),
+    ])
+    expect(resourcesFor('ecs:DescribeServices')).toEqual(resourcesFor('ecs:UpdateService'))
     expect(resourcesFor('ecs:RunTask')).toEqual([`arn:aws:ecs:${REGION}:${ACCOUNT}:task-definition/chore-scout-migrate:*`])
     const runTask = s.find((x) => list(x.Action).includes('ecs:RunTask'))!
     expect(runTask.Condition).toEqual({ ArnEquals: { 'ecs:cluster': `arn:aws:ecs:${REGION}:${ACCOUNT}:cluster/moroku-dsl-dev` } })
@@ -82,6 +87,8 @@ describe('IAM policies (CS-3992)', () => {
     const pass = s.filter((x) => list(x.Action).includes('iam:PassRole'))
     expect(pass).toHaveLength(1)
     expect(list(pass[0]!.Resource).sort()).toEqual([
+      `arn:aws:iam::${ACCOUNT}:role/chore-scout-jobs-bank_bilgola-task-role`,
+      `arn:aws:iam::${ACCOUNT}:role/chore-scout-jobs-bank_manly-task-role`,
       `arn:aws:iam::${ACCOUNT}:role/chore-scout-server-execution-role`,
       `arn:aws:iam::${ACCOUNT}:role/chore-scout-server-task-role`,
     ])
@@ -92,7 +99,8 @@ describe('IAM policies (CS-3992)', () => {
     expect(ec2).toEqual(['ec2:DescribeSecurityGroups'])
     expect(resourcesFor('ec2:DescribeSecurityGroups')).toEqual(['*'])
 
-    const forbidden = ['ec2:AuthorizeSecurityGroupIngress', 'ec2:ModifyNetworkInterfaceAttribute', 'ecs:CreateService', 'ecs:DeleteService', 'ecs:StopTask', 'iam:CreateRole', 'secretsmanager:GetSecretValue']
+    // Nothing that could start, stop or create a jobs service, or read a bank’s credential.
+    const forbidden = ['ec2:AuthorizeSecurityGroupIngress', 'ec2:ModifyNetworkInterfaceAttribute', 'ecs:CreateService', 'ecs:DeleteService', 'ecs:StopTask', 'iam:CreateRole', 'secretsmanager:GetSecretValue', 'cloudwatch:PutMetricAlarm', 'logs:PutMetricFilter']
     for (const a of forbidden) expect(resourcesFor(a)).toEqual([])
   })
 
@@ -160,6 +168,56 @@ describe('task definition templates (CS-3992)', () => {
     expect(c.name).toBe('chore-scout-migrate')
     expect(c.command).toEqual(['node', 'dist/migrate-main.js'])
     expect(c.portMappings).toBeUndefined()
+  })
+})
+
+describe('jobs runtime templates (CS-3992, CS-3979)', () => {
+  const td = json('infra/ecs-task-definition.jobs.json')
+  const c = td.containerDefinitions[0]
+  const env = Object.fromEntries(c.environment.map((e: { name: string; value: string }) => [e.name, e.value]))
+
+  it('one family per bank, the bank’s own task role and secret, the jobs command, no ports', () => {
+    expect(td.family).toBe('chore-scout-jobs-__TENANT_ID__')
+    expect(td.networkMode).toBe('awsvpc')
+    expect(td.requiresCompatibilities).toEqual(['FARGATE'])
+    expect(td.executionRoleArn).toBe(`arn:aws:iam::${ACCOUNT}:role/chore-scout-server-execution-role`)
+    expect(td.taskRoleArn).toBe(`arn:aws:iam::${ACCOUNT}:role/chore-scout-jobs-__TENANT_ID__-task-role`)
+    expect(td.containerDefinitions).toHaveLength(1)
+    expect(c.name).toBe('chore-scout-jobs')
+    expect(c.image).toBe('__IMAGE_PINNED_AT_DEPLOY__')
+    expect(c.command).toEqual(['node', 'dist/jobs-main.js'])
+    expect(c.portMappings).toBeUndefined()
+    expect(c.secrets).toBeUndefined()
+    expect(c.stopTimeout).toBeGreaterThanOrEqual(30) // SIGTERM releases the bank's lease
+    expect(c.healthCheck.command).toEqual(['CMD', 'node', 'dist/jobs-healthcheck.js'])
+    expect(c.logConfiguration.options['awslogs-group']).toBe('/ecs/chore-scout-server')
+    expect(c.logConfiguration.options['awslogs-stream-prefix']).toBe('jobs-__TENANT_ID__')
+  })
+
+  it('configuration: its bank, its own secret, BOB’s address; no credential, clock or URI in the environment', () => {
+    expect(env).toMatchObject({
+      ALLOWANCE_TENANT_ID: '__TENANT_ID__',
+      CS_SECRETS_ID: 'chore-scout-server/jobs-__TENANT_ID__',
+      BOB_API_URL: 'https://bob.moroku.digital',
+      MONGODB_DB: 'chorescout',
+      MONGODB_TLS_CA_FILE: '/app/certs/rds-global-bundle.pem',
+      NODE_ENV: 'production',
+    })
+    for (const k of ['MONGODB_URI', 'GIT_SHA', 'BOB_ALLOWANCE_CREDENTIAL']) expect(env[k]).toBeUndefined()
+    expect(forbiddenCredentialKeys(env)).toEqual([])
+    expect(Object.keys(env).filter((k) => /CLOCK|FAKE_?TIME|TIME_TRAVEL|TIME_OFFSET|NOW_OVERRIDE/i.test(k))).toEqual([])
+    expect(Number(env.JOB_TICK_INTERVAL_MS)).toBeLessThan(Number(env.JOB_LEASE_TTL_MS))
+  })
+
+  it('jobs task role: reads only its own bank’s jobs secret; nothing else', () => {
+    const s = statements('infra/iam/jobs-task-role-policy.json')
+    expect(s.flatMap((x) => list(x.Action))).toEqual(['secretsmanager:GetSecretValue'])
+    expect(s.flatMap((x) => list(x.Resource))).toEqual([`arn:aws:secretsmanager:${REGION}:${ACCOUNT}:secret:chore-scout-server/jobs-__TENANT_ID__-??????`])
+  })
+
+  it('every placeholder the deploy script fills is one of the two it knows', () => {
+    const raw = readFileSync('infra/ecs-task-definition.jobs.json', 'utf8') + readFileSync('infra/iam/jobs-task-role-policy.json', 'utf8')
+    expect([...new Set(raw.match(/__[A-Z_]+__/g))].sort()).toEqual(['__IMAGE_PINNED_AT_DEPLOY__', '__TENANT_ID__'])
   })
 })
 

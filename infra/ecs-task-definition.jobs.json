@@ -1,0 +1,47 @@
+{
+  "family": "chore-scout-jobs-__TENANT_ID__",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": { "cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX" },
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::932027117528:role/chore-scout-server-execution-role",
+  "taskRoleArn": "arn:aws:iam::932027117528:role/chore-scout-jobs-__TENANT_ID__-task-role",
+  "containerDefinitions": [
+    {
+      "name": "chore-scout-jobs",
+      "image": "__IMAGE_PINNED_AT_DEPLOY__",
+      "essential": true,
+      "command": ["node", "dist/jobs-main.js"],
+      "stopTimeout": 30,
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "LOG_LEVEL", "value": "info" },
+        { "name": "AWS_REGION", "value": "ap-southeast-2" },
+        { "name": "CS_SECRETS_ID", "value": "chore-scout-server/jobs-__TENANT_ID__" },
+        { "name": "ALLOWANCE_TENANT_ID", "value": "__TENANT_ID__" },
+        { "name": "BOB_API_URL", "value": "https://bob.moroku.digital" },
+        { "name": "MONGODB_DB", "value": "chorescout" },
+        { "name": "MONGODB_TLS_CA_FILE", "value": "/app/certs/rds-global-bundle.pem" },
+        { "name": "JOB_LEASE_TTL_MS", "value": "30000" },
+        { "name": "JOB_TICK_INTERVAL_MS", "value": "10000" }
+      ],
+      "linuxParameters": { "initProcessEnabled": true },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/chore-scout-server",
+          "awslogs-region": "ap-southeast-2",
+          "awslogs-stream-prefix": "jobs-__TENANT_ID__"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD", "node", "dist/jobs-healthcheck.js"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
